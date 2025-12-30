@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # API
     API_KEY: str | None = None
 
+    # Reminders
+    REMINDER_LEAD_MIN: int = 10
+    CALL_FOLLOWUP_DAYS: int = 1
+
     # Telegram
     TELEGRAM_BOT_TOKEN: str | None = None
 

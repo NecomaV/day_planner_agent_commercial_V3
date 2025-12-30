@@ -32,6 +32,8 @@ cp .env.example .env
 
 - `TELEGRAM_BOT_TOKEN` is required for the bot.
 - `API_KEY` is optional. If set, the REST API requires `X-API-Key`.
+- `REMINDER_LEAD_MIN` controls how many minutes before a task starts a reminder is sent.
+- `CALL_FOLLOWUP_DAYS` controls default follow-up delay for `/call`.
 
 ## 3) Create / migrate DB (Alembic)
 
@@ -58,8 +60,17 @@ python run_telegram_bot.py
 - `/start` - help
 - `/me` - show user id
 - `/todo <minutes> <text>` - create a backlog task
+- `/capture <text>` - quick task capture with date/time parsing
+- `/call <name> [notes]` - log a call and create follow-up
 - `/plan [YYYY-MM-DD]` - show plan (scheduled + backlog)
 - `/autoplan <days> [YYYY-MM-DD]` - schedule backlog tasks + ensure anchors
+- `/morning` - show today's morning routine
+- `/routine_add <offset> <duration> <title> [| kind]` - add routine step
+- `/routine_list` - list routine steps
+- `/routine_del <step_id>` - delete routine step
+- `/pantry add|remove|list <item>` - manage pantry
+- `/breakfast` - suggest breakfast from pantry
+- `/workout today|show|set|clear|list ...` - workout plan commands
 - `/slots <id> [YYYY-MM-DD]` - show slots for a task
 - `/place <id> <slot#> [HH:MM]` - place task into a slot
 - `/schedule <id> <HH:MM> [YYYY-MM-DD]` - schedule by time
@@ -80,6 +91,7 @@ python run_telegram_bot.py
 ### Migrations (Alembic)
 All schema changes go through migrations:
 - `alembic/versions/0001_initial.py`
+- `alembic/versions/0002_assistant_features.py`
 
 ### Multi-user
 - Every Telegram chat = separate user (stored in `users.telegram_chat_id`).
@@ -88,6 +100,7 @@ All schema changes go through migrations:
 ### Idempotency
 - Anchors are UPSERTed via `anchor_key` (`user_id + anchor_key` unique).
 - User-created tasks support optional `idempotency_key` (used in Telegram via message_id).
+- Routine steps use daily idempotency keys like `routine:<step_id>:YYYY-MM-DD`.
 - `/autoplan` is non-destructive:
   - it does not delete previously scheduled tasks
   - it only schedules tasks that are still unscheduled

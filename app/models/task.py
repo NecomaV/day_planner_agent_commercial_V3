@@ -11,6 +11,7 @@ class Task(Base):
         UniqueConstraint("user_id", "anchor_key", name="uq_tasks_user_anchor_key"),
         UniqueConstraint("user_id", "idempotency_key", name="uq_tasks_user_idempotency_key"),
         Index("ix_tasks_user_planned_start", "user_id", "planned_start"),
+        Index("ix_tasks_reminder_sent_at", "reminder_sent_at"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -45,9 +46,11 @@ class Task(Base):
 
     # How the time was assigned: manual | autoplan | system
     schedule_source: Mapped[str] = mapped_column(String(20), default="manual", index=True)
+    reminder_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Audit fields
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow(), onupdate=lambda: dt.datetime.utcnow())
 
     user = relationship("User", back_populates="tasks")
+    checklist_items = relationship("TaskChecklist", back_populates="task", cascade="all, delete-orphan")

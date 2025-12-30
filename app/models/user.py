@@ -20,3 +20,6 @@ class User(Base):
 
     tasks = relationship("Task", back_populates="user", cascade="all, delete-orphan")
     routine = relationship("RoutineConfig", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    routine_steps = relationship("RoutineStep", back_populates="user", cascade="all, delete-orphan")
+    pantry_items = relationship("PantryItem", back_populates="user", cascade="all, delete-orphan")
+    workout_plans = relationship("WorkoutPlan", back_populates="user", cascade="all, delete-orphan")

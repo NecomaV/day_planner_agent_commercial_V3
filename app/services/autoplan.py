@@ -4,6 +4,7 @@ import datetime as dt
 from typing import Dict, List, Optional, Tuple
 
 from app import crud
+from app.services.routine_steps import ensure_day_routine_steps
 from app.services.slots import Interval, build_busy_intervals, day_bounds, gaps_from_busy
 
 
@@ -65,7 +66,10 @@ def ensure_day_anchors(db, user_id: int, day: dt.date, routine) -> None:
         planned_end=morning_end,
     )
 
-    # After inserting morning, refresh busy
+    # Routine steps follow the morning start and should block the timeline.
+    ensure_day_routine_steps(db, user_id, day, routine)
+
+    # After inserting morning + routine steps, refresh busy
     scheduled = crud.list_scheduled_for_day(db, user_id, day)
     busy = build_busy_intervals(scheduled, routine)
 

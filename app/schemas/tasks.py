@@ -101,6 +101,7 @@ class TaskOut(BaseModel):
     planned_start: dt.datetime | None
     planned_end: dt.datetime | None
     due_at: dt.datetime | None
+    reminder_sent_at: dt.datetime | None
 
     priority: int
     estimate_minutes: int
