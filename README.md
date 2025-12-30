@@ -34,6 +34,9 @@ cp .env.example .env
 - `API_KEY` is optional. If set, the REST API requires `X-API-Key`.
 - `REMINDER_LEAD_MIN` controls how many minutes before a task starts a reminder is sent.
 - `CALL_FOLLOWUP_DAYS` controls default follow-up delay for `/call`.
+- `OPENAI_API_KEY` enables optional voice transcription and AI intent parsing.
+- `OPENAI_TRANSCRIBE_MODEL` controls the speech-to-text model (default `whisper-1`).
+- `OPENAI_CHAT_MODEL` controls the AI model for intent parsing (default `gpt-4o-mini`).
 
 ## 3) Create / migrate DB (Alembic)
 
@@ -71,12 +74,19 @@ python run_telegram_bot.py
 - `/pantry add|remove|list <item>` - manage pantry
 - `/breakfast` - suggest breakfast from pantry
 - `/workout today|show|set|clear|list ...` - workout plan commands
+- `/cabinet` - show account status and quick stats
+- `/login` - activate account
+- `/logout` - deactivate account
 - `/slots <id> [YYYY-MM-DD]` - show slots for a task
 - `/place <id> <slot#> [HH:MM]` - place task into a slot
 - `/schedule <id> <HH:MM> [YYYY-MM-DD]` - schedule by time
 - `/unschedule <id>` - move to backlog
 - `/done <id>` - mark done
 - `/delete <id>` - delete task
+- You can also send plain text to add tasks (no command needed).
+- Voice messages require `OPENAI_API_KEY` to enable transcription.
+- Free-text parsing is improved when `OPENAI_API_KEY` is set.
+- New users are guided through an onboarding wizard on `/start`.
 
 ## Key concepts implemented
 
@@ -92,6 +102,7 @@ python run_telegram_bot.py
 All schema changes go through migrations:
 - `alembic/versions/0001_initial.py`
 - `alembic/versions/0002_assistant_features.py`
+- `alembic/versions/0003_user_flags.py`
 
 ### Multi-user
 - Every Telegram chat = separate user (stored in `users.telegram_chat_id`).

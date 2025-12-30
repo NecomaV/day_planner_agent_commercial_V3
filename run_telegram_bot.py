@@ -7,19 +7,23 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import re
+import tempfile
 from collections import defaultdict
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from app import crud
 from app.db import SessionLocal
 from app.schemas.tasks import TaskCreate
 from app.settings import settings
 from app.services.autoplan import autoplan_days, ensure_day_anchors
+from app.services.ai_transcribe import transcribe_audio
+from app.services.ai_intent import parse_intent
 from app.services.meal_suggest import suggest_meals
 from app.services.quick_capture import parse_quick_task
 from app.services.reminders import format_reminder_message
@@ -91,10 +95,429 @@ def _parse_weekday(value: str) -> int | None:
     return mapping.get(value)
 
 
+def _parse_time_value(text: str) -> dt.time | None:
+    m = re.search(r"(\\d{1,2})(?::(\\d{2}))?", text)
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    if hh > 23 or mm > 59:
+        return None
+    return dt.time(hh, mm)
+
+
 async def _get_user(update: Update, db):
     chat_id = update.effective_chat.id
     return crud.get_or_create_user_by_chat_id(db, chat_id=chat_id)
 
+
+async def _get_active_user(update: Update, context: ContextTypes.DEFAULT_TYPE, db):
+    user = await _get_user(update, db)
+    if not user.is_active:
+        await update.message.reply_text("You are logged out. Use /login to activate.")
+        return None
+    return user
+
+
+async def _get_ready_user(update: Update, context: ContextTypes.DEFAULT_TYPE, db):
+    user = await _get_active_user(update, context, db)
+    if not user:
+        return None
+    if not user.onboarded:
+        await update.message.reply_text("Let's set you up first.")
+        await _start_onboarding(update, context)
+        return None
+    return user
+
+
+def _split_items(text: str) -> list[str]:
+    items = [i.strip() for i in re.split(r"[;,]", text) if i.strip()]
+    if len(items) == 1 and re.search(r"\band\b", items[0], re.IGNORECASE):
+        items = [i.strip() for i in re.split(r"\band\b", items[0], flags=re.IGNORECASE) if i.strip()]
+    return items
+
+
+def _extract_routine_items(text: str) -> list[str]:
+    lower = text.lower()
+    triggers = ["every morning", "each morning", "add to routine", "morning routine", "routine:"]
+    if not any(t in lower for t in triggers):
+        return []
+    cleaned = text
+    for t in triggers:
+        cleaned = re.sub(re.escape(t), "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace(":", " ")
+    return _split_items(cleaned)
+
+
+async def _start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["onboarding_step"] = "wake"
+    await update.message.reply_text("Welcome! What time do you usually wake up? (HH:MM). You can type 'skip'.")
+
+
+def _apply_wake_time(routine, wake_str: str) -> None:
+    routine.sleep_target_wakeup = wake_str
+    try:
+        t = parse_hhmm(wake_str)
+    except Exception:
+        return
+    base = dt.datetime.combine(dt.date.today(), t)
+    b_start = (base + dt.timedelta(minutes=30)).time().strftime("%H:%M")
+    b_end = (base + dt.timedelta(hours=3)).time().strftime("%H:%M")
+    routine.breakfast_window_start = b_start
+    routine.breakfast_window_end = b_end
+
+
+def _suggest_routine_steps(goal: str) -> list[str]:
+    goal = goal.strip().lower()
+    if any(x in goal for x in ["fitness", "gym", "workout", "health"]):
+        return ["Hydrate", "Stretch", "Light workout", "Protein breakfast", "Plan day"]
+    if any(x in goal for x in ["work", "focus", "business", "study", "learn"]):
+        return ["Hydrate", "Review priorities", "Deep work block", "Breakfast", "Inbox sweep"]
+    if any(x in goal for x in ["family", "kids", "home"]):
+        return ["Hydrate", "Check family schedule", "Breakfast", "School prep", "Quick tidy"]
+    return ["Hydrate", "Stretch", "Breakfast", "Plan day"]
+
+
+async def _handle_onboarding_text(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+) -> bool:
+    step = context.user_data.get("onboarding_step")
+    if not step and user.onboarded:
+        return False
+
+    if not step:
+        await _start_onboarding(update, context)
+        return True
+
+    routine = crud.get_routine(db, user.id)
+
+    if step == "wake":
+        if text.strip().lower() in {"skip", "later"}:
+            context.user_data["onboarding_step"] = "goal"
+            await update.message.reply_text("No problem. What is your main focus right now? (work, fitness, family, study, other)")
+            return True
+        t = _parse_time_value(text) or None
+        if not t:
+            await update.message.reply_text("Please enter time as HH:MM, e.g. 07:30")
+            return True
+        wake_str = f"{t.hour:02d}:{t.minute:02d}"
+        _apply_wake_time(routine, wake_str)
+        db.add(routine)
+        db.commit()
+        context.user_data["onboarding_step"] = "bed"
+        await update.message.reply_text("Thanks. What time do you usually go to bed? (HH:MM)")
+        return True
+
+    if step == "bed":
+        if text.strip().lower() in {"skip", "later"}:
+            context.user_data["onboarding_step"] = "goal"
+            await update.message.reply_text("What is your main focus right now? (work, fitness, family, study, other)")
+            return True
+        t = _parse_time_value(text) or None
+        if not t:
+            await update.message.reply_text("Please enter time as HH:MM, e.g. 23:30")
+            return True
+        bed_str = f"{t.hour:02d}:{t.minute:02d}"
+        routine.sleep_target_bedtime = bed_str
+        db.add(routine)
+        db.commit()
+        context.user_data["onboarding_step"] = "goal"
+        await update.message.reply_text("What is your main focus right now? (work, fitness, family, study, other)")
+        return True
+
+    if step == "goal":
+        answer = text.strip().lower()
+        if answer in {"skip", "later"}:
+            user.onboarded = True
+            db.add(user)
+            db.commit()
+            context.user_data.pop("onboarding_step", None)
+            await update.message.reply_text("All set. You can now send tasks or use /morning.")
+            return True
+        suggestions = _suggest_routine_steps(answer)
+        context.user_data["suggested_steps"] = suggestions
+        context.user_data["onboarding_step"] = "suggest"
+        suggestion_text = ", ".join(suggestions)
+        await update.message.reply_text(
+            "Suggested routine: " + suggestion_text + "\n"
+            "Reply 'yes' to accept, or send your own list."
+        )
+        return True
+
+    if step == "suggest":
+        answer = text.strip().lower()
+        if answer in {"skip", "none"}:
+            user.onboarded = True
+            db.add(user)
+            db.commit()
+            context.user_data.pop("onboarding_step", None)
+            await update.message.reply_text("All set. You can now send tasks or use /morning.")
+            return True
+
+        if answer in {"yes", "ok", "okay", "sure", "y"}:
+            steps = context.user_data.get("suggested_steps") or ["Hydrate", "Stretch", "Breakfast", "Plan day"]
+        else:
+            steps = _split_items(text)
+            if not steps:
+                steps = context.user_data.get("suggested_steps") or ["Hydrate", "Stretch", "Breakfast", "Plan day"]
+
+        existing = crud.list_routine_steps(db, user.id, active_only=False)
+        position = len(existing) + 1
+        offset = 0
+        for title in steps:
+            crud.add_routine_step(
+                db,
+                user.id,
+                title=title,
+                offset_min=offset,
+                duration_min=10,
+                kind="morning",
+                position=position,
+            )
+            position += 1
+            offset += 10
+
+        user.onboarded = True
+        db.add(user)
+        db.commit()
+        context.user_data.pop("onboarding_step", None)
+        await update.message.reply_text("Routine saved. Use /morning to see it.")
+        return True
+
+    return False
+
+
+async def _process_user_text(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+) -> None:
+    if settings.OPENAI_API_KEY:
+        data = parse_intent(text, settings.OPENAI_API_KEY, settings.OPENAI_CHAT_MODEL)
+        if data:
+            handled = await _handle_ai_intent(data, text, update, context, db, user)
+            if handled:
+                return
+
+    items = _extract_routine_items(text)
+    if items:
+        existing = crud.list_routine_steps(db, user.id, active_only=False)
+        position = len(existing) + 1
+        offset = 0
+        for title in items:
+            crud.add_routine_step(
+                db,
+                user.id,
+                title=title,
+                offset_min=offset,
+                duration_min=10,
+                kind="morning",
+                position=position,
+            )
+            position += 1
+            offset += 10
+
+        await update.message.reply_text(f"Added {len(items)} routine steps. Use /morning to view.")
+        return
+
+    parsed = parse_quick_task(text, _now_local_naive())
+    payload = TaskCreate(
+        title=parsed.title,
+        notes=None,
+        estimate_minutes=30,
+        planned_start=None,
+        planned_end=None,
+        due_at=parsed.due_at,
+        priority=2,
+        kind=None,
+        idempotency_key=_idempotency_key(update),
+    )
+    task = crud.create_task(db, user_id=user.id, data=payload)
+    if parsed.checklist_items:
+        crud.add_checklist_items(db, task.id, parsed.checklist_items)
+
+    when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(no due time)"
+    checklist_info = f" Checklist: {len(parsed.checklist_items)} items." if parsed.checklist_items else ""
+    await update.message.reply_text(f"Added: {task.title} due {when}.{checklist_info}")
+
+
+async def _handle_ai_intent(
+    data: dict,
+    original_text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+) -> bool:
+    intent = (data.get("intent") or "").lower()
+    if intent == "routine":
+        items = data.get("items") or []
+        if isinstance(items, str):
+            items = _split_items(items)
+        if not items:
+            return False
+        existing = crud.list_routine_steps(db, user.id, active_only=False)
+        position = len(existing) + 1
+        offset = 0
+        for title in items:
+            crud.add_routine_step(
+                db,
+                user.id,
+                title=title,
+                offset_min=offset,
+                duration_min=10,
+                kind="morning",
+                position=position,
+            )
+            position += 1
+            offset += 10
+        await update.message.reply_text(f"Added {len(items)} routine steps. Use /morning to view.")
+        return True
+
+    if intent in {"pantry_add", "pantry_remove"}:
+        items = data.get("items") or []
+        if isinstance(items, str):
+            items = _split_items(items)
+            items = [{"name": i, "quantity": None} for i in items]
+        if not items:
+            return False
+        if intent == "pantry_add":
+            for item in items:
+                name = str(item.get("name", "")).strip()
+                qty = item.get("quantity")
+                if name:
+                    crud.upsert_pantry_item(db, user.id, name=name, quantity=qty)
+            await update.message.reply_text("Pantry updated.")
+            return True
+        for item in items:
+            name = str(item.get("name", "")).strip()
+            if name:
+                crud.remove_pantry_item(db, user.id, name=name)
+        await update.message.reply_text("Pantry updated.")
+        return True
+
+    if intent == "workout_set":
+        weekday = data.get("weekday")
+        title = (data.get("title") or "").strip()
+        details = data.get("details")
+        if weekday is None or not title:
+            return False
+        try:
+            weekday_int = int(weekday)
+        except ValueError:
+            return False
+        if weekday_int < 0 or weekday_int > 6:
+            return False
+        crud.set_workout_plan(db, user.id, weekday_int, title=title, details=details)
+        await update.message.reply_text(f"Saved workout plan for weekday {weekday_int}: {title}")
+        return True
+
+    if intent == "breakfast":
+        items = crud.list_pantry_items(db, user.id)
+        pantry_names = [i.name for i in items]
+        suggestions = suggest_meals(pantry_names, meal="breakfast", limit=3)
+        if not pantry_names:
+            await update.message.reply_text("Pantry is empty. Add items with /pantry add <item>")
+            return True
+        if not suggestions:
+            await update.message.reply_text("No matching recipes yet. Add more pantry items.")
+            return True
+        lines = ["Breakfast ideas:"]
+        for s in suggestions:
+            if s["missing"]:
+                missing = ", ".join(s["missing"])
+                lines.append(f"- {s['name']} (missing: {missing})")
+            else:
+                lines.append(f"- {s['name']} (all ingredients available)")
+        await update.message.reply_text("\n".join(lines))
+        return True
+
+    if intent == "plan":
+        routine = crud.get_routine(db, user.id)
+        day = _now_local_naive().date()
+        ensure_day_anchors(db, user.id, day, routine)
+        tasks = crud.list_tasks_for_day(db, user.id, day)
+        scheduled = [t for t in tasks if t.planned_start and not t.is_done]
+        backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
+        await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine))
+        return True
+
+    if intent == "task":
+        text = data.get("text") or original_text
+        parsed = parse_quick_task(text, _now_local_naive())
+        payload = TaskCreate(
+            title=parsed.title,
+            notes=None,
+            estimate_minutes=30,
+            planned_start=None,
+            planned_end=None,
+            due_at=parsed.due_at,
+            priority=2,
+            kind=None,
+            idempotency_key=_idempotency_key(update),
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        if parsed.checklist_items:
+            crud.add_checklist_items(db, task.id, parsed.checklist_items)
+        when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(no due time)"
+        checklist_info = f" Checklist: {len(parsed.checklist_items)} items." if parsed.checklist_items else ""
+        await update.message.reply_text(f"Added: {task.title} due {when}.{checklist_info}")
+        return True
+
+    return False
+
+
+async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
+    if not text:
+        return
+    with get_db_session() as db:
+        user = await _get_active_user(update, context, db)
+        if not user:
+            return
+        if await _handle_onboarding_text(text, update, context, db, user):
+            return
+        await _process_user_text(text, update, context, db, user)
+
+
+async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.voice:
+        return
+    with get_db_session() as db:
+        user = await _get_active_user(update, context, db)
+        if not user:
+            return
+
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "voice.ogg"
+            await file.download_to_drive(custom_path=str(path))
+            transcript = transcribe_audio(
+                str(path),
+                settings.OPENAI_API_KEY,
+                model=settings.OPENAI_TRANSCRIBE_MODEL,
+            )
+
+        if not transcript:
+            await update.message.reply_text(
+                "Voice received, but transcription is not enabled. "
+                "Set OPENAI_API_KEY or send text instead."
+            )
+            return
+
+        await update.message.reply_text(f"Heard: {transcript}")
+        if await _handle_onboarding_text(transcript, update, context, db, user):
+            return
+        await _process_user_text(transcript, update, context, db, user)
 
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = _now_local_naive()
@@ -111,6 +534,8 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         for user_id, items in grouped.items():
             user = users.get(user_id)
             if not user:
+                continue
+            if not getattr(user, "is_active", True):
                 continue
             try:
                 chat_id = int(user.telegram_chat_id)
@@ -130,6 +555,17 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    with get_db_session() as db:
+        user = await _get_user(update, db)
+        if not user.is_active:
+            user.is_active = True
+            db.add(user)
+            db.commit()
+        if not user.onboarded:
+            await update.message.reply_text("Welcome! Let's set up your routine.")
+            await _start_onboarding(update, context)
+            return
+
     msg = (
         "Day Planner Agent.\n\n"
         "Commands:\n"
@@ -146,6 +582,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/pantry add|remove|list <item>\n"
         "/breakfast - suggest breakfast from pantry\n"
         "/workout today|show|set|clear|list ...\n"
+        "/cabinet - show account status and stats\n"
+        "/login - activate account\n"
+        "/logout - deactivate account\n"
         "/slots <id> [YYYY-MM-DD] - show slots for a task\n"
         "/place <id> <slot#> [HH:MM] - place into a slot\n"
         "/schedule <id> <HH:MM> [YYYY-MM-DD] - schedule by time\n"
@@ -167,6 +606,48 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"- timezone: {settings.TZ}\n\n"
             f"API header: X-User-Id = user_id{api_key_hint}"
         )
+
+
+async def cmd_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    with get_db_session() as db:
+        user = await _get_user(update, db)
+        steps = crud.list_routine_steps(db, user.id, active_only=False)
+        pantry = crud.list_pantry_items(db, user.id)
+        workouts = crud.list_workout_plans(db, user.id)
+        status = "active" if user.is_active else "inactive"
+        onboarded = "yes" if user.onboarded else "no"
+        await update.message.reply_text(
+            "Cabinet:\n"
+            f"- status: {status}\n"
+            f"- onboarded: {onboarded}\n"
+            f"- routine steps: {len(steps)}\n"
+            f"- pantry items: {len(pantry)}\n"
+            f"- workout plans: {len(workouts)}"
+        )
+
+
+async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    with get_db_session() as db:
+        user = await _get_user(update, db)
+        if user.is_active:
+            await update.message.reply_text("You are already active.")
+            return
+        user.is_active = True
+        db.add(user)
+        db.commit()
+        await update.message.reply_text("Welcome back.")
+        if not user.onboarded:
+            await _start_onboarding(update, context)
+
+
+async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    with get_db_session() as db:
+        user = await _get_user(update, db)
+        user.is_active = False
+        db.add(user)
+        db.commit()
+        context.user_data.pop("onboarding_step", None)
+        await update.message.reply_text("You are now logged out. Use /login to activate again.")
 
 
 def _render_day_plan(tasks, backlog, day: dt.date, routine) -> str:
@@ -208,7 +689,9 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         day = _now_local_naive().date()
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         routine = crud.get_routine(db, user.id)
 
         ensure_day_anchors(db, user.id, day, routine)
@@ -223,7 +706,9 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     day = _now_local_naive().date()
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         routine = crud.get_routine(db, user.id)
         ensure_day_anchors(db, user.id, day, routine)
 
@@ -266,7 +751,9 @@ async def cmd_routine_add(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         existing = crud.list_routine_steps(db, user.id, active_only=False)
         position = len(existing) + 1
         step = crud.add_routine_step(
@@ -284,7 +771,9 @@ async def cmd_routine_add(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def cmd_routine_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         steps = crud.list_routine_steps(db, user.id, active_only=False)
         if not steps:
             await update.message.reply_text("No routine steps yet. Use /routine_add.")
@@ -308,7 +797,9 @@ async def cmd_routine_del(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         ok = crud.delete_routine_step(db, user.id, step_id)
         if not ok:
             await update.message.reply_text("Routine step not found")
@@ -326,7 +817,9 @@ async def cmd_pantry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     rest = " ".join(context.args[1:]).strip()
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
 
         if action in {"list", "ls"}:
             items = crud.list_pantry_items(db, user.id)
@@ -370,7 +863,9 @@ async def cmd_pantry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_breakfast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         items = crud.list_pantry_items(db, user.id)
         pantry_names = [i.name for i in items]
 
@@ -400,7 +895,9 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     args = context.args[1:]
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
 
         if action == "today":
             weekday = _now_local_naive().weekday()
@@ -484,7 +981,9 @@ async def cmd_capture(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     parsed = parse_quick_task(text, now)
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         payload = TaskCreate(
             title=parsed.title,
             notes=None,
@@ -517,7 +1016,9 @@ async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     due_at = dt.datetime.combine(due_day, dt.time(9, 0))
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         task = crud.create_task_fields(
             db,
             user.id,
@@ -551,7 +1052,9 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         payload = TaskCreate(
             title=title,
             notes=None,
@@ -578,7 +1081,9 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         task = crud.get_task(db, user.id, task_id)
         if not task:
             await update.message.reply_text("Task not found")
@@ -600,7 +1105,9 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         task = crud.get_task(db, user.id, task_id)
         if not task:
             await update.message.reply_text("Task not found")
@@ -622,7 +1129,9 @@ async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         task = crud.get_task(db, user.id, task_id)
         if not task:
             await update.message.reply_text("Task not found")
@@ -655,7 +1164,9 @@ async def cmd_autoplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         routine = crud.get_routine(db, user.id)
         result = autoplan_days(db, user.id, routine, days=days, start_date=start_date)
 
@@ -691,7 +1202,9 @@ async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     date_arg = context.args[1] if len(context.args) >= 2 else None
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
@@ -730,7 +1243,9 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     hhmm = context.args[2] if len(context.args) >= 3 else None
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
@@ -800,7 +1315,9 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     date_arg = context.args[2] if len(context.args) >= 3 else None
 
     with get_db_session() as db:
-        user = await _get_user(update, db)
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
@@ -887,12 +1404,18 @@ def main() -> None:
     app.add_handler(CommandHandler("pantry", cmd_pantry))
     app.add_handler(CommandHandler("breakfast", cmd_breakfast))
     app.add_handler(CommandHandler("workout", cmd_workout))
+    app.add_handler(CommandHandler("cabinet", cmd_cabinet))
+    app.add_handler(CommandHandler("login", cmd_login))
+    app.add_handler(CommandHandler("logout", cmd_logout))
     app.add_handler(CommandHandler("done", cmd_done))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("unschedule", cmd_unschedule))
     app.add_handler(CommandHandler("slots", cmd_slots))
     app.add_handler(CommandHandler("place", cmd_place))
     app.add_handler(CommandHandler("schedule", cmd_schedule))
+
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     app.job_queue.run_repeating(reminder_job, interval=60, first=15)
 

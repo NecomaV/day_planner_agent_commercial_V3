@@ -114,6 +114,7 @@ def parse_quick_task(text: str, now: dt.datetime) -> QuickCaptureResult:
     stripped = re.sub(r"\b(today|tomorrow)\b", "", stripped, flags=re.IGNORECASE)
     stripped = TIME_RE.sub("", stripped)
     stripped = re.sub(r"\b(at|by)\b", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\b(please|remind me to|i need to|i need|need to|need|add)\b", "", stripped, flags=re.IGNORECASE)
     title = " ".join(stripped.split()).strip()
     if not title:
         title = original

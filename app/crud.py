@@ -40,6 +40,28 @@ def list_users(db: Session) -> list[User]:
     return list(db.execute(select(User).order_by(User.id.asc())).scalars())
 
 
+def set_user_active(db: Session, user_id: int, is_active: bool) -> User | None:
+    user = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    if not user:
+        return None
+    user.is_active = is_active
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def set_user_onboarded(db: Session, user_id: int, onboarded: bool) -> User | None:
+    user = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    if not user:
+        return None
+    user.onboarded = onboarded
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
 def ensure_routine(db: Session, user_id: int) -> RoutineConfig:
     r = db.execute(select(RoutineConfig).where(RoutineConfig.user_id == user_id)).scalar_one_or_none()
     if r:

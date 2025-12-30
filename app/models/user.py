@@ -1,5 +1,5 @@
 import datetime as dt
-from sqlalchemy import String, DateTime, Integer, UniqueConstraint
+from sqlalchemy import Boolean, String, DateTime, Integer, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -15,6 +15,8 @@ class User(Base):
 
     telegram_chat_id: Mapped[str] = mapped_column(String(64), index=True)
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Almaty")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    onboarded: Mapped[bool] = mapped_column(Boolean, default=False)
 
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
 
