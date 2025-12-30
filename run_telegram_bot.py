@@ -64,6 +64,20 @@ def _idempotency_key(update: Update) -> Optional[str]:
     return f"tg:{update.effective_chat.id}:{update.message.message_id}"
 
 
+def _parse_command_text(text: str) -> tuple[str, list[str]] | None:
+    raw = text.strip()
+    if not raw.startswith("/"):
+        return None
+    parts = raw.lstrip("/").split()
+    if not parts:
+        return None
+    return parts[0].lower(), parts[1:]
+
+
+def _extract_task_ids(text: str) -> list[int]:
+    return [int(x) for x in re.findall(r"\b\d+\b", text)]
+
+
 def _parse_weekday(value: str) -> int | None:
     value = value.strip().lower()
     mapping = {
@@ -91,15 +105,57 @@ def _parse_weekday(value: str) -> int | None:
         "saturday": 5,
         "sun": 6,
         "sunday": 6,
+        "пн": 0,
+        "понедельник": 0,
+        "вт": 1,
+        "вторник": 1,
+        "ср": 2,
+        "среда": 2,
+        "чт": 3,
+        "четверг": 3,
+        "пт": 4,
+        "пятница": 4,
+        "сб": 5,
+        "суббота": 5,
+        "вс": 6,
+        "воскресенье": 6,
     }
     return mapping.get(value)
 
 
 def _parse_time_value(text: str) -> dt.time | None:
-    m = re.search(r"(\\d{1,2})(?::(\\d{2}))?", text)
+    lower = text.lower()
+    range_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*[-–—]\s*(\d{1,2})(?::(\d{2}))?", lower)
+    meridian_pm = bool(re.search(r"\b(pm|вечера|дня)\b", lower))
+    meridian_am = bool(re.search(r"\b(am|утра|ночи)\b", lower))
+
+    def apply_meridian(hh: int) -> int:
+        if meridian_pm and hh < 12:
+            return hh + 12
+        if meridian_am and hh == 12:
+            return 0
+        return hh
+
+    if range_match:
+        h1 = int(range_match.group(1))
+        m1 = int(range_match.group(2) or 0)
+        h2 = int(range_match.group(3))
+        m2 = int(range_match.group(4) or 0)
+        h1 = apply_meridian(h1)
+        h2 = apply_meridian(h2)
+        if h1 > 23 or m1 > 59 or h2 > 23 or m2 > 59:
+            return None
+        start = dt.datetime.combine(dt.date.today(), dt.time(h1, m1))
+        end = dt.datetime.combine(dt.date.today(), dt.time(h2, m2))
+        if end <= start:
+            return dt.time(h1, m1)
+        midpoint = start + (end - start) / 2
+        return midpoint.time().replace(second=0, microsecond=0)
+
+    m = re.search(r"(\d{1,2})(?::(\d{2}))?", lower)
     if not m:
         return None
-    hh = int(m.group(1))
+    hh = apply_meridian(int(m.group(1)))
     mm = int(m.group(2) or 0)
     if hh > 23 or mm > 59:
         return None
@@ -114,7 +170,7 @@ async def _get_user(update: Update, db):
 async def _get_active_user(update: Update, context: ContextTypes.DEFAULT_TYPE, db):
     user = await _get_user(update, db)
     if not user.is_active:
-        await update.message.reply_text("You are logged out. Use /login to activate.")
+        await update.message.reply_text("Вы вышли. Используйте /login для активации.")
         return None
     return user
 
@@ -124,7 +180,7 @@ async def _get_ready_user(update: Update, context: ContextTypes.DEFAULT_TYPE, db
     if not user:
         return None
     if not user.onboarded:
-        await update.message.reply_text("Let's set you up first.")
+        await update.message.reply_text("Сначала пройдем настройку.")
         await _start_onboarding(update, context)
         return None
     return user
@@ -139,7 +195,18 @@ def _split_items(text: str) -> list[str]:
 
 def _extract_routine_items(text: str) -> list[str]:
     lower = text.lower()
-    triggers = ["every morning", "each morning", "add to routine", "morning routine", "routine:"]
+    triggers = [
+        "every morning",
+        "each morning",
+        "add to routine",
+        "morning routine",
+        "routine:",
+        "каждое утро",
+        "утренняя рутина",
+        "добавь в рутину",
+        "в рутину",
+        "рутина:",
+    ]
     if not any(t in lower for t in triggers):
         return []
     cleaned = text
@@ -149,9 +216,205 @@ def _extract_routine_items(text: str) -> list[str]:
     return _split_items(cleaned)
 
 
+DATE_TOKEN_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+RUS_WEEKDAY_MAP = {
+    "пн": 0,
+    "понедельник": 0,
+    "вт": 1,
+    "вторник": 1,
+    "ср": 2,
+    "среда": 2,
+    "чт": 3,
+    "четверг": 3,
+    "пт": 4,
+    "пятница": 4,
+    "сб": 5,
+    "суббота": 5,
+    "вс": 6,
+    "воскресенье": 6,
+}
+
+
+def _detect_day_from_text(text: str, now: dt.datetime) -> dt.date:
+    lower = text.lower()
+    if "сегодня" in lower or "today" in lower:
+        return now.date()
+    if "послезавтра" in lower:
+        return now.date() + dt.timedelta(days=2)
+    if "завтра" in lower or "tomorrow" in lower:
+        return now.date() + dt.timedelta(days=1)
+    m = DATE_TOKEN_RE.search(text)
+    if m:
+        try:
+            return dt.date.fromisoformat(m.group(1))
+        except ValueError:
+            pass
+    m = re.search(r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b", lower)
+    if m:
+        token = m.group(2)
+        target = RUS_WEEKDAY_MAP.get(token, now.weekday())
+        days_ahead = (target - now.weekday() + 7) % 7
+        days_ahead = 7 if days_ahead == 0 else days_ahead
+        return now.date() + dt.timedelta(days=days_ahead)
+    return now.date()
+
+
+def _is_plan_request(text: str) -> bool:
+    return bool(re.search(r"\b(план|расписание|график|розклад|plan)\b", text, flags=re.IGNORECASE))
+
+
+def _is_breakfast_request(text: str) -> bool:
+    return bool(re.search(r"\b(завтрак|breakfast)\b", text, flags=re.IGNORECASE))
+
+
+def _is_autoplan_request(text: str) -> bool:
+    return bool(re.search(r"\b(автоплан|autoplan|распланируй|распланировать)\b", text, flags=re.IGNORECASE))
+
+
+def _parse_autoplan_args(text: str) -> list[str]:
+    days = None
+    m = re.search(r"\b(\d{1,2})\b", text)
+    if m:
+        days = m.group(1)
+    date_match = DATE_TOKEN_RE.search(text)
+    args = []
+    args.append(days or "1")
+    if date_match:
+        args.append(date_match.group(1))
+    return args
+
+
+def _format_task_choice(task, routine) -> str:
+    if task.planned_start:
+        when = task.planned_start.strftime("%H:%M")
+    elif task.due_at:
+        when = task.due_at.strftime("%Y-%m-%d %H:%M")
+    else:
+        when = "без времени"
+    mins = task_display_minutes(task, routine)
+    return f"- id={task.id} {task.title} ({when}, ~{mins}м)"
+
+
+def _list_open_tasks(db, user, routine, limit: int = 8) -> list:
+    today = _now_local_naive().date()
+    tasks = crud.list_tasks_for_day(db, user.id, today)
+    open_tasks = [t for t in tasks if not t.is_done and t.task_type == "user"]
+    open_tasks.sort(key=lambda t: (t.planned_start is None, t.planned_start or dt.datetime.max, t.id))
+    return open_tasks[:limit]
+
+
+async def _prompt_task_selection(action: str, update: Update, context: ContextTypes.DEFAULT_TYPE, db, user, routine) -> None:
+    tasks = _list_open_tasks(db, user, routine)
+    if not tasks:
+        await update.message.reply_text("Нет активных задач для выбора.")
+        return
+    context.user_data["pending_action"] = {
+        "action": action,
+        "candidate_ids": [t.id for t in tasks],
+    }
+    lines = ["Уточните id задачи:"]
+    lines.extend([_format_task_choice(t, routine) for t in tasks])
+    lines.append("Можно ответить только числом, например: 12. Для отмены: отмена.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def _apply_task_action(action: str, task_id: int, update: Update, db, user) -> bool:
+    task = crud.get_task(db, user.id, task_id)
+    if not task:
+        await update.message.reply_text("Задача не найдена")
+        return False
+    if action == "delete":
+        crud.delete_task(db, user.id, task_id)
+        await update.message.reply_text(f"Удалено (id={task_id})")
+        return True
+    if action == "done":
+        crud.update_task_fields(db, user.id, task_id, is_done=True, schedule_source="manual")
+        await update.message.reply_text(f"Готово (id={task_id})")
+        return True
+    if action == "unschedule":
+        if task.task_type != "user":
+            await update.message.reply_text("Только пользовательские задачи можно убирать из расписания.")
+            return True
+        crud.update_task_fields(db, user.id, task_id, planned_start=None, planned_end=None, schedule_source="manual")
+        await update.message.reply_text(f"Перемещено в бэклог (id={task_id}).")
+        return True
+    return False
+
+
+async def _handle_pending_action(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+    routine,
+) -> bool:
+    pending = context.user_data.get("pending_action")
+    if not pending:
+        return False
+    answer = text.strip().lower()
+    if answer in {"отмена", "cancel", "stop", "стоп"}:
+        context.user_data.pop("pending_action", None)
+        await update.message.reply_text("Ок, отменено.")
+        return True
+    ids = _extract_task_ids(text)
+    if not ids:
+        await update.message.reply_text("Пришлите id задачи или напишите «отмена».")
+        return True
+    task_id = ids[0]
+    candidate_ids = set(pending.get("candidate_ids") or [])
+    if candidate_ids and task_id not in candidate_ids:
+        await update.message.reply_text("Пожалуйста, выберите id из списка.")
+        return True
+    context.user_data.pop("pending_action", None)
+    return await _apply_task_action(pending.get("action", ""), task_id, update, db, user)
+
+
+async def _run_command_by_name(
+    name: str,
+    args: list[str],
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> bool:
+    handlers = {
+        "start": cmd_start,
+        "me": cmd_me,
+        "todo": cmd_todo,
+        "capture": cmd_capture,
+        "call": cmd_call,
+        "plan": cmd_plan,
+        "autoplan": cmd_autoplan,
+        "morning": cmd_morning,
+        "routine_add": cmd_routine_add,
+        "routine_list": cmd_routine_list,
+        "routine_del": cmd_routine_del,
+        "pantry": cmd_pantry,
+        "breakfast": cmd_breakfast,
+        "workout": cmd_workout,
+        "cabinet": cmd_cabinet,
+        "login": cmd_login,
+        "logout": cmd_logout,
+        "done": cmd_done,
+        "delete": cmd_delete,
+        "unschedule": cmd_unschedule,
+        "slots": cmd_slots,
+        "place": cmd_place,
+        "schedule": cmd_schedule,
+    }
+    handler = handlers.get(name)
+    if not handler:
+        return False
+    original_args = context.args
+    context.args = args
+    try:
+        await handler(update, context)
+    finally:
+        context.args = original_args
+    return True
+
 async def _start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["onboarding_step"] = "wake"
-    await update.message.reply_text("Welcome! What time do you usually wake up? (HH:MM). You can type 'skip'.")
+    await update.message.reply_text("Добро пожаловать! Во сколько обычно просыпаетесь? (HH:MM). Можно написать «пропустить».")
 
 
 def _apply_wake_time(routine, wake_str: str) -> None:
@@ -170,12 +433,12 @@ def _apply_wake_time(routine, wake_str: str) -> None:
 def _suggest_routine_steps(goal: str) -> list[str]:
     goal = goal.strip().lower()
     if any(x in goal for x in ["fitness", "gym", "workout", "health"]):
-        return ["Hydrate", "Stretch", "Light workout", "Protein breakfast", "Plan day"]
+        return ["Стакан воды", "Растяжка", "Легкая тренировка", "Белковый завтрак", "План дня"]
     if any(x in goal for x in ["work", "focus", "business", "study", "learn"]):
-        return ["Hydrate", "Review priorities", "Deep work block", "Breakfast", "Inbox sweep"]
+        return ["Стакан воды", "Приоритеты дня", "Фокус-блок", "Завтрак", "Разбор входящих"]
     if any(x in goal for x in ["family", "kids", "home"]):
-        return ["Hydrate", "Check family schedule", "Breakfast", "School prep", "Quick tidy"]
-    return ["Hydrate", "Stretch", "Breakfast", "Plan day"]
+        return ["Стакан воды", "Проверка семейного расписания", "Завтрак", "Сборы", "Быстрая уборка"]
+    return ["Стакан воды", "Растяжка", "Завтрак", "План дня"]
 
 
 async def _handle_onboarding_text(
@@ -196,47 +459,47 @@ async def _handle_onboarding_text(
     routine = crud.get_routine(db, user.id)
 
     if step == "wake":
-        if text.strip().lower() in {"skip", "later"}:
+        if text.strip().lower() in {"skip", "later", "пропустить", "потом", "не знаю"}:
             context.user_data["onboarding_step"] = "goal"
-            await update.message.reply_text("No problem. What is your main focus right now? (work, fitness, family, study, other)")
+            await update.message.reply_text("Какой сейчас главный фокус? (работа, фитнес, семья, учеба, другое)")
             return True
         t = _parse_time_value(text) or None
         if not t:
-            await update.message.reply_text("Please enter time as HH:MM, e.g. 07:30")
+            await update.message.reply_text("Введите время в формате HH:MM, например 07:30")
             return True
         wake_str = f"{t.hour:02d}:{t.minute:02d}"
         _apply_wake_time(routine, wake_str)
         db.add(routine)
         db.commit()
         context.user_data["onboarding_step"] = "bed"
-        await update.message.reply_text("Thanks. What time do you usually go to bed? (HH:MM)")
+        await update.message.reply_text("Спасибо. Во сколько обычно ложитесь спать? (HH:MM)")
         return True
 
     if step == "bed":
-        if text.strip().lower() in {"skip", "later"}:
+        if text.strip().lower() in {"skip", "later", "пропустить", "потом", "не знаю"}:
             context.user_data["onboarding_step"] = "goal"
-            await update.message.reply_text("What is your main focus right now? (work, fitness, family, study, other)")
+            await update.message.reply_text("Какой сейчас главный фокус? (работа, фитнес, семья, учеба, другое)")
             return True
         t = _parse_time_value(text) or None
         if not t:
-            await update.message.reply_text("Please enter time as HH:MM, e.g. 23:30")
+            await update.message.reply_text("Введите время в формате HH:MM, например 23:30")
             return True
         bed_str = f"{t.hour:02d}:{t.minute:02d}"
         routine.sleep_target_bedtime = bed_str
         db.add(routine)
         db.commit()
         context.user_data["onboarding_step"] = "goal"
-        await update.message.reply_text("What is your main focus right now? (work, fitness, family, study, other)")
+        await update.message.reply_text("Какой сейчас главный фокус? (работа, фитнес, семья, учеба, другое)")
         return True
 
     if step == "goal":
         answer = text.strip().lower()
-        if answer in {"skip", "later"}:
+        if answer in {"skip", "later", "пропустить", "потом", "не знаю"}:
             user.onboarded = True
             db.add(user)
             db.commit()
             context.user_data.pop("onboarding_step", None)
-            await update.message.reply_text("All set. You can now send tasks or use /morning.")
+            await update.message.reply_text("Готово. Теперь можно отправлять задачи или использовать /morning.")
             return True
         suggestions = suggest_routine_steps(
             answer,
@@ -247,27 +510,27 @@ async def _handle_onboarding_text(
         context.user_data["onboarding_step"] = "suggest"
         suggestion_text = ", ".join(suggestions)
         await update.message.reply_text(
-            "Suggested routine: " + suggestion_text + "\n"
-            "Reply 'yes' to accept, or send your own list."
+            "Предлагаемая рутина: " + suggestion_text + "\n"
+            "Ответьте «да», чтобы принять, или пришлите свой список."
         )
         return True
 
     if step == "suggest":
         answer = text.strip().lower()
-        if answer in {"skip", "none"}:
+        if answer in {"skip", "none", "пропустить", "нет"}:
             user.onboarded = True
             db.add(user)
             db.commit()
             context.user_data.pop("onboarding_step", None)
-            await update.message.reply_text("All set. You can now send tasks or use /morning.")
+            await update.message.reply_text("Готово. Теперь можно отправлять задачи или использовать /morning.")
             return True
 
-        if answer in {"yes", "ok", "okay", "sure", "y"}:
-            steps = context.user_data.get("suggested_steps") or ["Hydrate", "Stretch", "Breakfast", "Plan day"]
+        if answer in {"yes", "ok", "okay", "sure", "y", "да", "ок", "хорошо"}:
+            steps = context.user_data.get("suggested_steps") or ["Стакан воды", "Растяжка", "Завтрак", "План дня"]
         else:
             steps = _split_items(text)
             if not steps:
-                steps = context.user_data.get("suggested_steps") or ["Hydrate", "Stretch", "Breakfast", "Plan day"]
+                steps = context.user_data.get("suggested_steps") or ["Стакан воды", "Растяжка", "Завтрак", "План дня"]
 
         existing = crud.list_routine_steps(db, user.id, active_only=False)
         position = len(existing) + 1
@@ -289,7 +552,7 @@ async def _handle_onboarding_text(
         db.add(user)
         db.commit()
         context.user_data.pop("onboarding_step", None)
-        await update.message.reply_text("Routine saved. Use /morning to see it.")
+        await update.message.reply_text("Рутина сохранена. Используйте /morning, чтобы увидеть ее.")
         return True
 
     return False
@@ -302,12 +565,86 @@ async def _process_user_text(
     db,
     user,
 ) -> None:
+    routine = crud.get_routine(db, user.id)
+
+    if await _handle_pending_action(text, update, context, db, user, routine):
+        return
+
+    parsed_command = _parse_command_text(text)
+    if parsed_command:
+        name, args = parsed_command
+        if name in {"delete", "done", "unschedule"} and not args:
+            await _prompt_task_selection(name, update, context, db, user, routine)
+            return
+        handled = await _run_command_by_name(name, args, update, context)
+        if handled:
+            return
+
     if settings.OPENAI_API_KEY:
         data = parse_intent(text, settings.OPENAI_API_KEY, settings.OPENAI_CHAT_MODEL)
         if data:
             handled = await _handle_ai_intent(data, text, update, context, db, user)
             if handled:
                 return
+
+    lower = text.lower()
+    if any(word in lower for word in ["удали", "удалить", "delete", "стереть", "убери задачу"]):
+        ids = _extract_task_ids(text)
+        if ids:
+            await _apply_task_action("delete", ids[0], update, db, user)
+        else:
+            await _prompt_task_selection("delete", update, context, db, user, routine)
+        return
+
+    if any(word in lower for word in ["сделано", "готово", "закрыть", "завершить", "done"]):
+        ids = _extract_task_ids(text)
+        if ids:
+            await _apply_task_action("done", ids[0], update, db, user)
+        else:
+            await _prompt_task_selection("done", update, context, db, user, routine)
+        return
+
+    if any(word in lower for word in ["убери из расписания", "сними с плана", "перенеси в бэклог", "unschedule"]):
+        ids = _extract_task_ids(text)
+        if ids:
+            await _apply_task_action("unschedule", ids[0], update, db, user)
+        else:
+            await _prompt_task_selection("unschedule", update, context, db, user, routine)
+        return
+
+    if _is_autoplan_request(text):
+        args = _parse_autoplan_args(text)
+        await _run_command_by_name("autoplan", args, update, context)
+        return
+
+    if _is_plan_request(text):
+        day = _detect_day_from_text(text, _now_local_naive())
+        ensure_day_anchors(db, user.id, day, routine)
+        tasks = crud.list_tasks_for_day(db, user.id, day)
+        scheduled = [t for t in tasks if t.planned_start and not t.is_done]
+        backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
+        await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine))
+        return
+
+    if _is_breakfast_request(text):
+        items = crud.list_pantry_items(db, user.id)
+        pantry_names = [i.name for i in items]
+        suggestions = suggest_meals(pantry_names, meal="breakfast", limit=3)
+        if not pantry_names:
+            await update.message.reply_text("В кладовой пусто. Добавьте продукты через /pantry add <продукт>.")
+            return
+        if not suggestions:
+            await update.message.reply_text("Нет подходящих рецептов. Добавьте больше продуктов.")
+            return
+        lines = ["Идеи для завтрака:"]
+        for s in suggestions:
+            if s["missing"]:
+                missing = ", ".join(s["missing"])
+                lines.append(f"- {s['name']} (не хватает: {missing})")
+            else:
+                lines.append(f"- {s['name']} (все есть)")
+        await update.message.reply_text("\n".join(lines))
+        return
 
     items = _extract_routine_items(text)
     if items:
@@ -327,7 +664,7 @@ async def _process_user_text(
             position += 1
             offset += 10
 
-        await update.message.reply_text(f"Added {len(items)} routine steps. Use /morning to view.")
+        await update.message.reply_text(f"Добавлено шагов: {len(items)}. Используйте /morning для просмотра.")
         return
 
     parsed = parse_quick_task(text, _now_local_naive())
@@ -346,9 +683,9 @@ async def _process_user_text(
     if parsed.checklist_items:
         crud.add_checklist_items(db, task.id, parsed.checklist_items)
 
-    when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(no due time)"
-    checklist_info = f" Checklist: {len(parsed.checklist_items)} items." if parsed.checklist_items else ""
-    await update.message.reply_text(f"Added: {task.title} due {when}.{checklist_info}")
+    when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(без срока)"
+    checklist_info = f" Чек-лист: {len(parsed.checklist_items)} пунктов." if parsed.checklist_items else ""
+    await update.message.reply_text(f"Добавлено: {task.title}. Срок: {when}.{checklist_info}")
 
 
 async def _handle_ai_intent(
@@ -381,7 +718,7 @@ async def _handle_ai_intent(
             )
             position += 1
             offset += 10
-        await update.message.reply_text(f"Added {len(items)} routine steps. Use /morning to view.")
+        await update.message.reply_text(f"Добавлено шагов рутины: {len(items)}. Используйте /morning для просмотра.")
         return True
 
     if intent in {"pantry_add", "pantry_remove"}:
@@ -397,13 +734,13 @@ async def _handle_ai_intent(
                 qty = item.get("quantity")
                 if name:
                     crud.upsert_pantry_item(db, user.id, name=name, quantity=qty)
-            await update.message.reply_text("Pantry updated.")
+            await update.message.reply_text("Продукты обновлены.")
             return True
         for item in items:
             name = str(item.get("name", "")).strip()
             if name:
                 crud.remove_pantry_item(db, user.id, name=name)
-        await update.message.reply_text("Pantry updated.")
+        await update.message.reply_text("Продукты обновлены.")
         return True
 
     if intent == "workout_set":
@@ -419,7 +756,7 @@ async def _handle_ai_intent(
         if weekday_int < 0 or weekday_int > 6:
             return False
         crud.set_workout_plan(db, user.id, weekday_int, title=title, details=details)
-        await update.message.reply_text(f"Saved workout plan for weekday {weekday_int}: {title}")
+        await update.message.reply_text(f"План тренировки сохранен для дня {weekday_int}: {title}")
         return True
 
     if intent == "breakfast":
@@ -427,18 +764,18 @@ async def _handle_ai_intent(
         pantry_names = [i.name for i in items]
         suggestions = suggest_meals(pantry_names, meal="breakfast", limit=3)
         if not pantry_names:
-            await update.message.reply_text("Pantry is empty. Add items with /pantry add <item>")
+            await update.message.reply_text("В кладовой пусто. Добавьте продукты через /pantry add <продукт>.")
             return True
         if not suggestions:
-            await update.message.reply_text("No matching recipes yet. Add more pantry items.")
+            await update.message.reply_text("Нет подходящих рецептов. Добавьте больше продуктов.")
             return True
-        lines = ["Breakfast ideas:"]
+        lines = ["Идеи для завтрака:"]
         for s in suggestions:
             if s["missing"]:
                 missing = ", ".join(s["missing"])
-                lines.append(f"- {s['name']} (missing: {missing})")
+                lines.append(f"- {s['name']} (не хватает: {missing})")
             else:
-                lines.append(f"- {s['name']} (all ingredients available)")
+                lines.append(f"- {s['name']} (все есть)")
         await update.message.reply_text("\n".join(lines))
         return True
 
@@ -451,6 +788,19 @@ async def _handle_ai_intent(
         backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
         await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine))
         return True
+
+    if intent == "command":
+        name = str(data.get("name", "")).strip().lower()
+        args = data.get("args") or []
+        if isinstance(args, str):
+            args = args.split()
+        if not isinstance(args, list):
+            args = []
+        if name in {"delete", "done", "unschedule"} and not args:
+            routine = crud.get_routine(db, user.id)
+            await _prompt_task_selection(name, update, context, db, user, routine)
+            return True
+        return await _run_command_by_name(name, [str(a) for a in args], update, context)
 
     if intent == "task":
         text = data.get("text") or original_text
@@ -469,9 +819,9 @@ async def _handle_ai_intent(
         task = crud.create_task(db, user_id=user.id, data=payload)
         if parsed.checklist_items:
             crud.add_checklist_items(db, task.id, parsed.checklist_items)
-        when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(no due time)"
-        checklist_info = f" Checklist: {len(parsed.checklist_items)} items." if parsed.checklist_items else ""
-        await update.message.reply_text(f"Added: {task.title} due {when}.{checklist_info}")
+        when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(без срока)"
+        checklist_info = f" Чек-лист: {len(parsed.checklist_items)} пунктов." if parsed.checklist_items else ""
+        await update.message.reply_text(f"Добавлено: {task.title}. Срок: {when}.{checklist_info}")
         return True
 
     return False
@@ -509,16 +859,17 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 str(path),
                 settings.OPENAI_API_KEY,
                 model=settings.OPENAI_TRANSCRIBE_MODEL,
+                language=settings.OPENAI_TRANSCRIBE_LANGUAGE,
             )
 
         if not transcript:
             await update.message.reply_text(
-                "Voice received, but transcription is not enabled. "
-                "Set OPENAI_API_KEY or send text instead."
+                "Голос получен, но распознавание не включено. "
+                "Установите OPENAI_API_KEY или отправьте текст."
             )
             return
 
-        await update.message.reply_text(f"Heard: {transcript}")
+        await update.message.reply_text(f"Распознано: {transcript}")
         if await _handle_onboarding_text(transcript, update, context, db, user):
             return
         await _process_user_text(transcript, update, context, db, user)
@@ -566,35 +917,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             db.add(user)
             db.commit()
         if not user.onboarded:
-            await update.message.reply_text("Welcome! Let's set up your routine.")
+            await update.message.reply_text("Добро пожаловать! Давайте настроим рутину.")
             await _start_onboarding(update, context)
             return
 
     msg = (
-        "Day Planner Agent.\n\n"
-        "Commands:\n"
-        "/me - show user_id\n"
-        "/todo <minutes> <text> - create a backlog task\n"
-        "/capture <text> - quick task capture with date/time\n"
-        "/call <name> [notes] - log a call and add follow-up\n"
-        "/plan [YYYY-MM-DD] - show plan\n"
-        "/autoplan <days> [YYYY-MM-DD] - schedule backlog\n"
-        "/morning - show today's morning routine\n"
-        "/routine_add <offset> <duration> <title> [| kind]\n"
-        "/routine_list - list routine steps\n"
-        "/routine_del <step_id> - delete routine step\n"
-        "/pantry add|remove|list <item>\n"
-        "/breakfast - suggest breakfast from pantry\n"
+        "Дневной планировщик.\n\n"
+        "Команды:\n"
+        "/me - показать user_id\n"
+        "/todo <минуты> <текст> - добавить задачу в бэклог\n"
+        "/capture <текст> - быстрое добавление с датой/временем\n"
+        "/call <имя> [заметки] - зафиксировать звонок и создать фоллоу-ап\n"
+        "/plan [YYYY-MM-DD] - показать план\n"
+        "/autoplan <дни> [YYYY-MM-DD] - распланировать бэклог\n"
+        "/morning - утренняя рутина на сегодня\n"
+        "/routine_add <смещение> <длительность> <название> [| тип]\n"
+        "/routine_list - список шагов рутины\n"
+        "/routine_del <id> - удалить шаг рутины\n"
+        "/pantry add|remove|list <продукт>\n"
+        "/breakfast - предложить завтрак из продуктов\n"
         "/workout today|show|set|clear|list ...\n"
-        "/cabinet - show account status and stats\n"
-        "/login - activate account\n"
-        "/logout - deactivate account\n"
-        "/slots <id> [YYYY-MM-DD] - show slots for a task\n"
-        "/place <id> <slot#> [HH:MM] - place into a slot\n"
-        "/schedule <id> <HH:MM> [YYYY-MM-DD] - schedule by time\n"
-        "/unschedule <id> - move back to backlog\n"
-        "/done <id> - mark done\n"
-        "/delete <id> - delete task\n"
+        "/cabinet - кабинет и статистика\n"
+        "/login - включить аккаунт\n"
+        "/logout - выключить аккаунт\n"
+        "/slots <id> [YYYY-MM-DD] - доступные слоты\n"
+        "/place <id> <slot#> [HH:MM] - поставить в слот\n"
+        "/schedule <id> <HH:MM> [YYYY-MM-DD] - запланировать по времени\n"
+        "/unschedule <id> - вернуть в бэклог\n"
+        "/done <id> - отметить выполненной\n"
+        "/delete <id> - удалить задачу\n"
     )
     await update.message.reply_text(msg)
 
@@ -602,13 +953,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
         user = await _get_user(update, db)
-        api_key_hint = " (X-API-Key required)" if settings.API_KEY else ""
+        api_key_hint = " (нужен X-API-Key)" if settings.API_KEY else ""
         await update.message.reply_text(
-            "User info:\n"
+            "Информация о пользователе:\n"
             f"- user_id: {user.id}\n"
             f"- telegram_chat_id: {user.telegram_chat_id}\n"
-            f"- timezone: {settings.TZ}\n\n"
-            f"API header: X-User-Id = user_id{api_key_hint}"
+            f"- часовой пояс: {settings.TZ}\n\n"
+            f"Заголовок API: X-User-Id = user_id{api_key_hint}"
         )
 
 
@@ -618,15 +969,15 @@ async def cmd_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         steps = crud.list_routine_steps(db, user.id, active_only=False)
         pantry = crud.list_pantry_items(db, user.id)
         workouts = crud.list_workout_plans(db, user.id)
-        status = "active" if user.is_active else "inactive"
-        onboarded = "yes" if user.onboarded else "no"
+        status = "активен" if user.is_active else "неактивен"
+        onboarded = "да" if user.onboarded else "нет"
         await update.message.reply_text(
-            "Cabinet:\n"
-            f"- status: {status}\n"
-            f"- onboarded: {onboarded}\n"
-            f"- routine steps: {len(steps)}\n"
-            f"- pantry items: {len(pantry)}\n"
-            f"- workout plans: {len(workouts)}"
+            "Кабинет:\n"
+            f"- статус: {status}\n"
+            f"- онбординг: {onboarded}\n"
+            f"- шагов рутины: {len(steps)}\n"
+            f"- продуктов в кладовой: {len(pantry)}\n"
+            f"- планов тренировок: {len(workouts)}"
         )
 
 
@@ -634,12 +985,12 @@ async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
         user = await _get_user(update, db)
         if user.is_active:
-            await update.message.reply_text("You are already active.")
+            await update.message.reply_text("Аккаунт уже активен.")
             return
         user.is_active = True
         db.add(user)
         db.commit()
-        await update.message.reply_text("Welcome back.")
+        await update.message.reply_text("С возвращением.")
         if not user.onboarded:
             await _start_onboarding(update, context)
 
@@ -651,12 +1002,12 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         db.add(user)
         db.commit()
         context.user_data.pop("onboarding_step", None)
-        await update.message.reply_text("You are now logged out. Use /login to activate again.")
+        await update.message.reply_text("Вы вышли. Используйте /login, чтобы включить аккаунт.")
 
 
 def _render_day_plan(tasks, backlog, day: dt.date, routine) -> str:
     lines = []
-    lines.append(f"Plan for {day.isoformat()}:\n")
+    lines.append(f"План на {day.isoformat()}:\n")
 
     if tasks:
         for i, t in enumerate(tasks, start=1):
@@ -664,19 +1015,19 @@ def _render_day_plan(tasks, backlog, day: dt.date, routine) -> str:
             e = t.planned_end.strftime("%H:%M")
             extra = ""
             if t.kind == "workout":
-                extra = f" (travel buffer: {routine.workout_travel_oneway_min}m each way)"
+                extra = f" (дорога: {routine.workout_travel_oneway_min}м в одну сторону)"
             tag = f" [{t.kind}]" if t.kind else ""
             status = "[x]" if t.is_done else "[ ]"
             lines.append(f"{status} {i}) {s}-{e} {t.title}{tag} (id={t.id}){extra}")
     else:
-        lines.append("(no scheduled tasks)")
+        lines.append("(нет запланированных задач)")
 
     if backlog:
-        lines.append("\nBacklog:")
+        lines.append("\nБэклог:")
         for i, t in enumerate(backlog, start=1):
             mins = task_display_minutes(t, routine)
-            lines.append(f"[ ] {i}) {t.title} ~ {mins}m (id={t.id})")
-        lines.append("\nTip: /autoplan 1")
+            lines.append(f"[ ] {i}) {t.title} ~ {mins}м (id={t.id})")
+        lines.append("\nПодсказка: /autoplan 1")
 
     return "\n".join(lines)
 
@@ -687,7 +1038,7 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             day = normalize_date_str(date_arg)
         except ValueError:
-            await update.message.reply_text("Date must be YYYY-MM-DD")
+            await update.message.reply_text("Дата должна быть в формате YYYY-MM-DD")
             return
     else:
         day = _now_local_naive().date()
@@ -720,11 +1071,11 @@ async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         routine_tasks = [t for t in tasks if t.task_type == "system" and (t.idempotency_key or "").startswith("routine:")]
 
         if not routine_tasks:
-            await update.message.reply_text("No routine steps yet. Use /routine_add to add one.")
+            await update.message.reply_text("Пока нет шагов рутины. Используйте /routine_add для добавления.")
             return
 
         routine_tasks.sort(key=lambda t: t.planned_start or dt.datetime.max)
-        lines = ["Morning routine:"]
+        lines = ["Утренняя рутина:"]
         for t in routine_tasks:
             s = t.planned_start.strftime("%H:%M") if t.planned_start else "?"
             e = t.planned_end.strftime("%H:%M") if t.planned_end else "?"
@@ -734,14 +1085,14 @@ async def cmd_morning(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def cmd_routine_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 3:
-        await update.message.reply_text("Usage: /routine_add <offset_min> <duration_min> <title> [| kind]")
+        await update.message.reply_text("Использование: /routine_add <смещение_мин> <длительность_мин> <название> [| тип]")
         return
 
     try:
         offset_min = int(context.args[0])
         duration_min = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("offset_min and duration_min must be integers")
+        await update.message.reply_text("смещение_мин и длительность_мин должны быть числами")
         return
 
     rest = " ".join(context.args[2:]).strip()
@@ -751,7 +1102,7 @@ async def cmd_routine_add(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         title, kind = [p.strip() for p in rest.split("|", 1)]
 
     if not title:
-        await update.message.reply_text("Title cannot be empty")
+        await update.message.reply_text("Название не может быть пустым")
         return
 
     with get_db_session() as db:
@@ -770,7 +1121,7 @@ async def cmd_routine_add(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             position=position,
         )
 
-    await update.message.reply_text(f"Added routine step: {step.title} (id={step.id})")
+    await update.message.reply_text(f"Добавлен шаг рутины: {step.title} (id={step.id})")
 
 
 async def cmd_routine_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -780,24 +1131,26 @@ async def cmd_routine_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
         steps = crud.list_routine_steps(db, user.id, active_only=False)
         if not steps:
-            await update.message.reply_text("No routine steps yet. Use /routine_add.")
+            await update.message.reply_text("Пока нет шагов рутины. Используйте /routine_add.")
             return
 
-        lines = ["Routine steps:"]
+        lines = ["Шаги рутины:"]
         for s in steps:
-            lines.append(f"- id={s.id} offset={s.offset_min}m dur={s.duration_min}m kind={s.kind} title={s.title}")
+            lines.append(
+                f"- id={s.id} смещение={s.offset_min}м длительность={s.duration_min}м тип={s.kind} название={s.title}"
+            )
         await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_routine_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /routine_del <step_id>")
+        await update.message.reply_text("Использование: /routine_del <id_шага>")
         return
 
     try:
         step_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("step_id must be an integer")
+        await update.message.reply_text("id_шага должен быть числом")
         return
 
     with get_db_session() as db:
@@ -806,15 +1159,15 @@ async def cmd_routine_del(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         ok = crud.delete_routine_step(db, user.id, step_id)
         if not ok:
-            await update.message.reply_text("Routine step not found")
+            await update.message.reply_text("Шаг рутины не найден")
             return
 
-    await update.message.reply_text(f"Deleted routine step id={step_id}")
+    await update.message.reply_text(f"Шаг рутины удален (id={step_id})")
 
 
 async def cmd_pantry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /pantry add|remove|list <item>")
+        await update.message.reply_text("Использование: /pantry add|remove|list <продукт>")
         return
 
     action = context.args[0].lower()
@@ -828,9 +1181,9 @@ async def cmd_pantry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         if action in {"list", "ls"}:
             items = crud.list_pantry_items(db, user.id)
             if not items:
-                await update.message.reply_text("Pantry is empty. Add items with /pantry add <item>")
+                await update.message.reply_text("В кладовой пусто. Добавьте продукты через /pantry add <продукт>")
                 return
-            lines = ["Pantry:"]
+            lines = ["Кладовая:"]
             for item in items:
                 qty = f" ({item.quantity})" if item.quantity else ""
                 lines.append(f"- {item.name}{qty}")
@@ -839,7 +1192,7 @@ async def cmd_pantry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
         if action == "add":
             if not rest:
-                await update.message.reply_text("Usage: /pantry add <item>[=qty]")
+                await update.message.reply_text("Использование: /pantry add <продукт>[=кол-во]")
                 return
             name = rest
             quantity = None
@@ -848,21 +1201,21 @@ async def cmd_pantry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             elif ":" in rest:
                 name, quantity = [p.strip() for p in rest.split(":", 1)]
             crud.upsert_pantry_item(db, user.id, name=name, quantity=quantity)
-            await update.message.reply_text(f"Added to pantry: {name}")
+            await update.message.reply_text(f"Добавлено в кладовую: {name}")
             return
 
         if action in {"remove", "del", "delete"}:
             if not rest:
-                await update.message.reply_text("Usage: /pantry remove <item>")
+                await update.message.reply_text("Использование: /pantry remove <продукт>")
                 return
             ok = crud.remove_pantry_item(db, user.id, name=rest)
             if not ok:
-                await update.message.reply_text("Item not found")
+                await update.message.reply_text("Продукт не найден")
                 return
-            await update.message.reply_text(f"Removed from pantry: {rest}")
+            await update.message.reply_text(f"Удалено из кладовой: {rest}")
             return
 
-    await update.message.reply_text("Usage: /pantry add|remove|list <item>")
+    await update.message.reply_text("Использование: /pantry add|remove|list <продукт>")
 
 
 async def cmd_breakfast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -875,24 +1228,24 @@ async def cmd_breakfast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     suggestions = suggest_meals(pantry_names, meal="breakfast", limit=3)
     if not pantry_names:
-        await update.message.reply_text("Pantry is empty. Add items with /pantry add <item>")
+        await update.message.reply_text("В кладовой пусто. Добавьте продукты через /pantry add <продукт>")
         return
     if not suggestions:
-        await update.message.reply_text("No matching recipes yet. Add more pantry items.")
+        await update.message.reply_text("Нет подходящих рецептов. Добавьте больше продуктов.")
         return
 
-    lines = ["Breakfast ideas:"]
+    lines = ["Идеи для завтрака:"]
     for s in suggestions:
         if s["missing"]:
             missing = ", ".join(s["missing"])
-            lines.append(f"- {s['name']} (missing: {missing})")
+            lines.append(f"- {s['name']} (не хватает: {missing})")
         else:
-            lines.append(f"- {s['name']} (all ingredients available)")
+            lines.append(f"- {s['name']} (все есть)")
     await update.message.reply_text("\n".join(lines))
 
 async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /workout today|show|set|clear|list ...")
+        await update.message.reply_text("Использование: /workout today|show|set|clear|list ...")
         return
 
     action = context.args[0].lower()
@@ -907,35 +1260,35 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             weekday = _now_local_naive().weekday()
             plan = crud.get_workout_plan(db, user.id, weekday)
             if not plan or not plan.is_active:
-                await update.message.reply_text("No workout plan for today.")
+                await update.message.reply_text("Плана тренировки на сегодня нет.")
                 return
-            text = plan.details or "(no details)"
-            await update.message.reply_text(f"Workout today: {plan.title}\n{text}")
+            text = plan.details or "(без подробностей)"
+            await update.message.reply_text(f"Тренировка сегодня: {plan.title}\n{text}")
             return
 
         if action == "show":
             if not args:
-                await update.message.reply_text("Usage: /workout show <weekday>")
+                await update.message.reply_text("Использование: /workout show <день_недели>")
                 return
             weekday = _parse_weekday(args[0])
             if weekday is None:
-                await update.message.reply_text("Invalid weekday. Use 0-6 or mon..sun")
+                await update.message.reply_text("Неверный день недели. Используйте 0-6 или пн..вс")
                 return
             plan = crud.get_workout_plan(db, user.id, weekday)
             if not plan or not plan.is_active:
-                await update.message.reply_text("No workout plan for that day.")
+                await update.message.reply_text("Плана тренировки на этот день нет.")
                 return
-            text = plan.details or "(no details)"
-            await update.message.reply_text(f"Workout plan: {plan.title}\n{text}")
+            text = plan.details or "(без подробностей)"
+            await update.message.reply_text(f"План тренировки: {plan.title}\n{text}")
             return
 
         if action == "set":
             if len(args) < 2:
-                await update.message.reply_text("Usage: /workout set <weekday> <title> | <details>")
+                await update.message.reply_text("Использование: /workout set <день> <название> | <детали>")
                 return
             weekday = _parse_weekday(args[0])
             if weekday is None:
-                await update.message.reply_text("Invalid weekday. Use 0-6 or mon..sun")
+                await update.message.reply_text("Неверный день недели. Используйте 0-6 или пн..вс")
                 return
             rest = " ".join(args[1:])
             title = rest
@@ -943,41 +1296,41 @@ async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             if "|" in rest:
                 title, details = [p.strip() for p in rest.split("|", 1)]
             plan = crud.set_workout_plan(db, user.id, weekday, title=title, details=details)
-            await update.message.reply_text(f"Saved workout plan for weekday {plan.weekday}: {plan.title}")
+            await update.message.reply_text(f"План тренировки сохранен для дня {plan.weekday}: {plan.title}")
             return
 
         if action == "clear":
             if not args:
-                await update.message.reply_text("Usage: /workout clear <weekday>")
+                await update.message.reply_text("Использование: /workout clear <день>")
                 return
             weekday = _parse_weekday(args[0])
             if weekday is None:
-                await update.message.reply_text("Invalid weekday. Use 0-6 or mon..sun")
+                await update.message.reply_text("Неверный день недели. Используйте 0-6 или пн..вс")
                 return
             ok = crud.clear_workout_plan(db, user.id, weekday)
             if not ok:
-                await update.message.reply_text("Workout plan not found")
+                await update.message.reply_text("План тренировки не найден")
                 return
-            await update.message.reply_text("Workout plan cleared")
+            await update.message.reply_text("План тренировки удален")
             return
 
         if action == "list":
             plans = crud.list_workout_plans(db, user.id)
             if not plans:
-                await update.message.reply_text("No workout plans yet. Use /workout set.")
+                await update.message.reply_text("Планов тренировок пока нет. Используйте /workout set.")
                 return
-            lines = ["Workout plans:"]
+            lines = ["Планы тренировок:"]
             for plan in plans:
-                lines.append(f"- weekday {plan.weekday}: {plan.title}")
+                lines.append(f"- день {plan.weekday}: {plan.title}")
             await update.message.reply_text("\n".join(lines))
             return
 
-    await update.message.reply_text("Usage: /workout today|show|set|clear|list ...")
+    await update.message.reply_text("Использование: /workout today|show|set|clear|list ...")
 
 
 async def cmd_capture(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /capture <text>")
+        await update.message.reply_text("Использование: /capture <текст>")
         return
 
     text = " ".join(context.args).strip()
@@ -1003,14 +1356,14 @@ async def cmd_capture(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if parsed.checklist_items:
             crud.add_checklist_items(db, task.id, parsed.checklist_items)
 
-    when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(no due time)"
-    checklist_info = f" Checklist: {len(parsed.checklist_items)} items." if parsed.checklist_items else ""
-    await update.message.reply_text(f"Captured: {task.title} due {when}.{checklist_info}")
+    when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(без срока)"
+    checklist_info = f" Чек-лист: {len(parsed.checklist_items)} пунктов." if parsed.checklist_items else ""
+    await update.message.reply_text(f"Добавлено: {task.title}. Срок: {when}.{checklist_info}")
 
 
 async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /call <name> [notes]")
+        await update.message.reply_text("Использование: /call <имя> [заметки]")
         return
 
     name = context.args[0].strip()
@@ -1026,7 +1379,7 @@ async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         task = crud.create_task_fields(
             db,
             user.id,
-            title=f"Follow up with {name}",
+            title=f"Фоллоу-ап по {name}",
             notes=notes,
             due_at=due_at,
             priority=2,
@@ -1035,24 +1388,24 @@ async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             schedule_source="manual",
             idempotency_key=_idempotency_key(update),
         )
-        crud.add_checklist_items(db, task.id, [f"Send summary to {name}"])
+        crud.add_checklist_items(db, task.id, [f"Отправить резюме {name}"])
 
-    await update.message.reply_text(f"Logged call. Follow-up task created (id={task.id}).")
+    await update.message.reply_text(f"Звонок зафиксирован. Создан фоллоу-ап (id={task.id}).")
 
 async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /todo <minutes> <text>")
+        await update.message.reply_text("Использование: /todo <минуты> <текст>")
         return
 
     try:
         estimate = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Minutes must be a number. Example: /todo 30 review inbox")
+        await update.message.reply_text("Минуты должны быть числом. Пример: /todo 30 разобрать почту")
         return
 
     title = " ".join(context.args[1:]).strip()
     if not title:
-        await update.message.reply_text("Title cannot be empty.")
+        await update.message.reply_text("Название не может быть пустым.")
         return
 
     with get_db_session() as db:
@@ -1071,17 +1424,17 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             idempotency_key=_idempotency_key(update),
         )
         task = crud.create_task(db, user_id=user.id, data=payload)
-        await update.message.reply_text(f"Created. Task id={task.id} added to backlog.")
+        await update.message.reply_text(f"Создано. Задача id={task.id} добавлена в бэклог.")
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /done <id>")
+        await update.message.reply_text("Использование: /done <id>")
         return
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id must be an integer")
+        await update.message.reply_text("id должен быть числом")
         return
 
     with get_db_session() as db:
@@ -1090,22 +1443,22 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Task not found")
+            await update.message.reply_text("Задача не найдена")
             return
 
         crud.update_task_fields(db, user.id, task_id, is_done=True, schedule_source="manual")
-        await update.message.reply_text(f"Done: (id={task_id})")
+        await update.message.reply_text(f"Готово (id={task_id})")
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /delete <id>")
+        await update.message.reply_text("Использование: /delete <id>")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id must be an integer")
+        await update.message.reply_text("id должен быть числом")
         return
 
     with get_db_session() as db:
@@ -1114,22 +1467,22 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             return
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Task not found")
+            await update.message.reply_text("Задача не найдена")
             return
 
         crud.delete_task(db, user.id, task_id)
-        await update.message.reply_text(f"Deleted (id={task_id})")
+        await update.message.reply_text(f"Удалено (id={task_id})")
 
 
 async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /unschedule <id>")
+        await update.message.reply_text("Использование: /unschedule <id>")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id must be an integer")
+        await update.message.reply_text("id должен быть числом")
         return
 
     with get_db_session() as db:
@@ -1138,25 +1491,25 @@ async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Task not found")
+            await update.message.reply_text("Задача не найдена")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Only user tasks can be unscheduled.")
+            await update.message.reply_text("Только пользовательские задачи можно убирать из расписания.")
             return
 
         crud.update_task_fields(db, user.id, task_id, planned_start=None, planned_end=None, schedule_source="manual")
-        await update.message.reply_text(f"Moved to backlog (id={task_id}).")
+        await update.message.reply_text(f"Перемещено в бэклог (id={task_id}).")
 
 
 async def cmd_autoplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /autoplan <days> [YYYY-MM-DD]")
+        await update.message.reply_text("Использование: /autoplan <дни> [YYYY-MM-DD]")
         return
 
     try:
         days = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("days must be an integer")
+        await update.message.reply_text("дни должны быть числом")
         return
 
     start_date = None
@@ -1164,7 +1517,7 @@ async def cmd_autoplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             start_date = normalize_date_str(context.args[1])
         except ValueError:
-            await update.message.reply_text("Date must be YYYY-MM-DD")
+            await update.message.reply_text("Дата должна быть в формате YYYY-MM-DD")
             return
 
     with get_db_session() as db:
@@ -1175,7 +1528,7 @@ async def cmd_autoplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         result = autoplan_days(db, user.id, routine, days=days, start_date=start_date)
 
     suffix = f" {start_date.isoformat()}" if start_date else ""
-    await update.message.reply_text(f"Autoplan complete: {result}\nPlan: /plan{suffix}")
+    await update.message.reply_text(f"Автопланирование завершено: {result}\nПлан: /plan{suffix}")
 
 
 def _gaps_for_day(db, user_id: int, day: dt.date, routine):
@@ -1194,13 +1547,13 @@ def _gaps_for_day(db, user_id: int, day: dt.date, routine):
 
 async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Usage: /slots <task_id> [YYYY-MM-DD]")
+        await update.message.reply_text("Использование: /slots <id_задачи> [YYYY-MM-DD]")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("task_id must be an integer")
+        await update.message.reply_text("id_задачи должен быть числом")
         return
 
     date_arg = context.args[1] if len(context.args) >= 2 else None
@@ -1212,17 +1565,17 @@ async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Task not found")
+            await update.message.reply_text("Задача не найдена")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Only user tasks can be scheduled via /slots.")
+            await update.message.reply_text("Через /slots можно планировать только пользовательские задачи.")
             return
 
         if date_arg:
             try:
                 day = normalize_date_str(date_arg)
             except ValueError:
-                await update.message.reply_text("Date must be YYYY-MM-DD")
+                await update.message.reply_text("Дата должна быть в формате YYYY-MM-DD")
                 return
         else:
             day = task.planned_start.date() if task.planned_start else _now_local_naive().date()
@@ -1234,14 +1587,14 @@ async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /place <task_id> <slot#> [HH:MM]")
+        await update.message.reply_text("Использование: /place <id_задачи> <слот#> [HH:MM]")
         return
 
     try:
         task_id = int(context.args[0])
         slot_idx = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("task_id and slot# must be integers")
+        await update.message.reply_text("id_задачи и слот# должны быть числами")
         return
 
     hhmm = context.args[2] if len(context.args) >= 3 else None
@@ -1253,17 +1606,17 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Task not found")
+            await update.message.reply_text("Задача не найдена")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Only user tasks can be scheduled via /place.")
+            await update.message.reply_text("Через /place можно планировать только пользовательские задачи.")
             return
 
         day = task.planned_start.date() if task.planned_start else _now_local_naive().date()
 
         gaps, _, _ = _gaps_for_day(db, user.id, day, routine)
         if slot_idx < 1 or slot_idx > len(gaps):
-            await update.message.reply_text("Invalid slot index. Use /slots <id>.")
+            await update.message.reply_text("Неверный номер слота. Используйте /slots <id>.")
             return
 
         gap = gaps[slot_idx - 1]
@@ -1280,7 +1633,7 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             latest = gap.end - core
 
         if latest < earliest:
-            await update.message.reply_text("This slot cannot fit the task. Use /slots again.")
+            await update.message.reply_text("Этот слот не подходит. Используйте /slots снова.")
             return
 
         start = earliest
@@ -1288,12 +1641,12 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 t = parse_hhmm(hhmm)
             except Exception:
-                await update.message.reply_text("Time must be HH:MM, e.g. 21:30")
+                await update.message.reply_text("Время должно быть HH:MM, например 21:30")
                 return
             candidate = dt.datetime.combine(day, t)
             if candidate < earliest or candidate > latest:
                 await update.message.reply_text(
-                    f"Time outside slot. Use {earliest.strftime('%H:%M')}-{latest.strftime('%H:%M')}"
+                    f"Время вне слота. Используйте {earliest.strftime('%H:%M')}-{latest.strftime('%H:%M')}"
                 )
                 return
             start = candidate
@@ -1301,18 +1654,20 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         end = start + core
         crud.update_task_fields(db, user.id, task_id, planned_start=start, planned_end=end, schedule_source="manual")
 
-    await update.message.reply_text(f"Scheduled (id={task_id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})")
+    await update.message.reply_text(
+        f"Запланировано (id={task_id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})"
+    )
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await update.message.reply_text("Usage: /schedule <task_id> <HH:MM> [YYYY-MM-DD]")
+        await update.message.reply_text("Использование: /schedule <id_задачи> <HH:MM> [YYYY-MM-DD]")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("task_id must be an integer")
+        await update.message.reply_text("id_задачи должен быть числом")
         return
 
     hhmm = context.args[1]
@@ -1325,17 +1680,17 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Task not found")
+            await update.message.reply_text("Задача не найдена")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Only user tasks can be scheduled via /schedule.")
+            await update.message.reply_text("Через /schedule можно планировать только пользовательские задачи.")
             return
 
         if date_arg:
             try:
                 day = normalize_date_str(date_arg)
             except ValueError:
-                await update.message.reply_text("Date must be YYYY-MM-DD")
+                await update.message.reply_text("Дата должна быть в формате YYYY-MM-DD")
                 return
         else:
             day = task.planned_start.date() if task.planned_start else _now_local_naive().date()
@@ -1343,7 +1698,7 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         try:
             t = parse_hhmm(hhmm)
         except Exception:
-            await update.message.reply_text("Time must be HH:MM")
+            await update.message.reply_text("Время должно быть HH:MM")
             return
 
         desired_start = dt.datetime.combine(day, t)
@@ -1368,13 +1723,15 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 break
 
         if not ok:
-            await update.message.reply_text("Time does not fit available slots. Use /slots <id>.")
+            await update.message.reply_text("Время не подходит под доступные слоты. Используйте /slots <id>.")
             return
 
         end = desired_start + core
         crud.update_task_fields(db, user.id, task_id, planned_start=desired_start, planned_end=end, schedule_source="manual")
 
-    await update.message.reply_text(f"Scheduled (id={task_id}) {desired_start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})")
+    await update.message.reply_text(
+        f"Запланировано (id={task_id}) {desired_start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})"
+    )
 
 
 def main() -> None:

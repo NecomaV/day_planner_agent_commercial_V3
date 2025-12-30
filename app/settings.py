@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str | None = None
     OPENAI_TRANSCRIBE_MODEL: str = "whisper-1"
     OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
+    OPENAI_TRANSCRIBE_LANGUAGE: str = "ru"
 
     # Telegram
     TELEGRAM_BOT_TOKEN: str | None = None

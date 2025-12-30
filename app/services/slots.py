@@ -149,14 +149,14 @@ def task_display_minutes(task, routine) -> int:
 def format_gap_options(task, gaps: List[Gap], routine, day: dt.date) -> str:
     mins = task_display_minutes(task, routine)
     lines = []
-    lines.append(f"Time slots for task (id={task.id}): {task.title} ~ {mins} min")
-    lines.append(f"Date: {day.isoformat()}\n")
+    lines.append(f"Слоты для задачи (id={task.id}): {task.title} ~ {mins} мин")
+    lines.append(f"Дата: {day.isoformat()}\n")
 
     if not gaps:
-        lines.append("No free slots in this window.")
+        lines.append("В этом окне нет свободных слотов.")
         return "\n".join(lines)
 
-    lines.append("Pick a slot and optional time within it:")
+    lines.append("Выберите слот и, при необходимости, время внутри него:")
     lines.append(f"/place {task.id} <slot#> [HH:MM]\n")
 
     for idx, g in enumerate(gaps, start=1):
@@ -166,19 +166,19 @@ def format_gap_options(task, gaps: List[Gap], routine, day: dt.date) -> str:
             earliest = g.start + travel
             latest = g.end - (core + travel)
             fit = latest >= earliest
-            fit_txt = "OK" if fit else "does not fit"
+            fit_txt = "подходит" if fit else "не подходит"
             lines.append(
-                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()}m) | "
-                f"start range: {earliest.strftime('%H:%M')}-{latest.strftime('%H:%M')} [{fit_txt}]"
+                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()} мин) | "
+                f"диапазон старта: {earliest.strftime('%H:%M')}-{latest.strftime('%H:%M')} [{fit_txt}]"
             )
         else:
             core = dt.timedelta(minutes=mins)
             latest = g.end - core
             fit = latest >= g.start
-            fit_txt = "OK" if fit else "does not fit"
+            fit_txt = "подходит" if fit else "не подходит"
             lines.append(
-                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()}m) | "
-                f"start range: {g.start.strftime('%H:%M')}-{latest.strftime('%H:%M')} [{fit_txt}]"
+                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()} мин) | "
+                f"диапазон старта: {g.start.strftime('%H:%M')}-{latest.strftime('%H:%M')} [{fit_txt}]"
             )
 
     return "\n".join(lines)

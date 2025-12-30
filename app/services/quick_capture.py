@@ -6,9 +6,10 @@ from dataclasses import dataclass
 
 
 DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE)
-CHECKLIST_RE = re.compile(r"\b(checklist|steps):\s*(.+)$", re.IGNORECASE)
+TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\b", re.IGNORECASE)
+CHECKLIST_RE = re.compile(r"\b(checklist|steps|чек\\s*-?лист|список|шаги|подзадачи):\s*(.+)$", re.IGNORECASE)
 NEXT_WEEKDAY_RE = re.compile(r"\bnext\s+(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE)
+RUS_WEEKDAY_RE = re.compile(r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b", re.IGNORECASE)
 
 
 WEEKDAY_MAP = {
@@ -30,6 +31,22 @@ WEEKDAY_MAP = {
     "sun": 6,
     "sunday": 6,
 }
+RUS_WEEKDAY_MAP = {
+    "пн": 0,
+    "понедельник": 0,
+    "вт": 1,
+    "вторник": 1,
+    "ср": 2,
+    "среда": 2,
+    "чт": 3,
+    "четверг": 3,
+    "пт": 4,
+    "пятница": 4,
+    "сб": 5,
+    "суббота": 5,
+    "вс": 6,
+    "воскресенье": 6,
+}
 
 
 @dataclass(frozen=True)
@@ -48,14 +65,26 @@ def _parse_date(text: str, now: dt.datetime) -> dt.date | None:
             return None
 
     lower = text.lower()
-    if "tomorrow" in lower:
+    if "tomorrow" in lower or "завтра" in lower:
         return now.date() + dt.timedelta(days=1)
-    if "today" in lower:
+    if "today" in lower or "сегодня" in lower:
         return now.date()
+    if "послезавтра" in lower:
+        return now.date() + dt.timedelta(days=2)
 
     m = NEXT_WEEKDAY_RE.search(text)
     if m:
         target = WEEKDAY_MAP.get(m.group(1).lower())
+        if target is None:
+            return None
+        days_ahead = (target - now.weekday() + 7) % 7
+        days_ahead = 7 if days_ahead == 0 else days_ahead
+        return now.date() + dt.timedelta(days=days_ahead)
+
+    m = RUS_WEEKDAY_RE.search(text)
+    if m:
+        token = m.group(2).lower()
+        target = RUS_WEEKDAY_MAP.get(token)
         if target is None:
             return None
         days_ahead = (target - now.weekday() + 7) % 7
@@ -71,10 +100,10 @@ def _parse_time(text: str) -> dt.time | None:
         return None
     hh = int(m.group(1))
     mm = int(m.group(2) or 0)
-    suffix = (m.group(3) or "").lower()
-    if suffix == "pm" and hh < 12:
+    lower = text.lower()
+    if re.search(r"\b(pm|вечера|дня)\b", lower) and hh < 12:
         hh += 12
-    if suffix == "am" and hh == 12:
+    if re.search(r"\b(am|утра|ночи)\b", lower) and hh == 12:
         hh = 0
     if hh > 23 or mm > 59:
         return None
@@ -111,10 +140,16 @@ def parse_quick_task(text: str, now: dt.datetime) -> QuickCaptureResult:
     stripped = cleaned
     stripped = DATE_RE.sub("", stripped)
     stripped = NEXT_WEEKDAY_RE.sub("", stripped)
-    stripped = re.sub(r"\b(today|tomorrow)\b", "", stripped, flags=re.IGNORECASE)
+    stripped = RUS_WEEKDAY_RE.sub("", stripped)
+    stripped = re.sub(r"\b(today|tomorrow|сегодня|завтра|послезавтра)\b", "", stripped, flags=re.IGNORECASE)
     stripped = TIME_RE.sub("", stripped)
-    stripped = re.sub(r"\b(at|by)\b", "", stripped, flags=re.IGNORECASE)
-    stripped = re.sub(r"\b(please|remind me to|i need to|i need|need to|need|add)\b", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\b(at|by|в|до|на)\b", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(
+        r"\b(please|remind me to|i need to|i need|need to|need|add|пожалуйста|напомни|напомните|мне нужно|нужно|надо|поставь|добавь|сделать|задача)\b",
+        "",
+        stripped,
+        flags=re.IGNORECASE,
+    )
     title = " ".join(stripped.split()).strip()
     if not title:
         title = original

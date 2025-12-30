@@ -37,6 +37,7 @@ cp .env.example .env
 - `OPENAI_API_KEY` enables optional voice transcription and AI intent parsing.
 - `OPENAI_TRANSCRIBE_MODEL` controls the speech-to-text model (default `whisper-1`).
 - `OPENAI_CHAT_MODEL` controls the AI model for intent parsing (default `gpt-4o-mini`).
+- `OPENAI_TRANSCRIBE_LANGUAGE` hints transcription language (default `ru`).
 
 ## 3) Create / migrate DB (Alembic)
 
