@@ -23,7 +23,7 @@ from app.schemas.tasks import TaskCreate
 from app.settings import settings
 from app.services.autoplan import autoplan_days, ensure_day_anchors
 from app.services.ai_transcribe import transcribe_audio
-from app.services.ai_intent import parse_intent
+from app.services.ai_intent import parse_intent, suggest_routine_steps
 from app.services.meal_suggest import suggest_meals
 from app.services.quick_capture import parse_quick_task
 from app.services.reminders import format_reminder_message
@@ -238,7 +238,11 @@ async def _handle_onboarding_text(
             context.user_data.pop("onboarding_step", None)
             await update.message.reply_text("All set. You can now send tasks or use /morning.")
             return True
-        suggestions = _suggest_routine_steps(answer)
+        suggestions = suggest_routine_steps(
+            answer,
+            settings.OPENAI_API_KEY,
+            settings.OPENAI_CHAT_MODEL,
+        ) or _suggest_routine_steps(answer)
         context.user_data["suggested_steps"] = suggestions
         context.user_data["onboarding_step"] = "suggest"
         suggestion_text = ", ".join(suggestions)
