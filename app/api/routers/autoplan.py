@@ -4,11 +4,12 @@ import datetime as dt
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from app import crud
 from app.db import get_db
-from app.api.deps import get_user_id
+from app.api.deps import get_user_id, require_api_key
 from app.services.autoplan import autoplan_days
 
-router = APIRouter(prefix="/autoplan", tags=["autoplan"])
+router = APIRouter(prefix="/autoplan", tags=["autoplan"], dependencies=[Depends(require_api_key)])
 
 
 @router.post("", response_model=list[dict])
@@ -19,4 +20,5 @@ def run_autoplan(
     user_id: int = Depends(get_user_id),
 ):
     start = start_date or dt.date.today()
-    return autoplan_days(db, user_id, start, days=days)
+    routine = crud.get_routine(db, user_id)
+    return autoplan_days(db, user_id, routine, days=days, start_date=start)

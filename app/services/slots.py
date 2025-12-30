@@ -1,16 +1,3 @@
-# -*- coding: utf-8 -*-
-"""app/services/slots.py
-
-Utilities to compute free time slots (gaps) and manually place tasks.
-
-Busy-time rules (must match autoplan):
-- Meals reserve an extra buffer after the meal: routine.meal_buffer_after_min.
-- Workouts reserve travel before/after the in-gym block: routine.workout_travel_oneway_min.
-  planned_start/planned_end remain the in-gym times.
-
-All datetimes in this project are naive local datetimes.
-"""
-
 from __future__ import annotations
 
 import datetime as dt
@@ -102,11 +89,11 @@ def _task_to_busy_interval(task, routine) -> Optional[Interval]:
     s = task.planned_start
     e = task.planned_end
 
-    # meals: buffer after
+    # Meals: buffer after
     if getattr(task, "kind", None) == "meal":
         e = e + dt.timedelta(minutes=routine.meal_buffer_after_min)
 
-    # workouts: travel before/after
+    # Workouts: travel before/after
     if getattr(task, "kind", None) == "workout":
         travel = dt.timedelta(minutes=routine.workout_travel_oneway_min)
         s = s - travel
@@ -162,15 +149,15 @@ def task_display_minutes(task, routine) -> int:
 def format_gap_options(task, gaps: List[Gap], routine, day: dt.date) -> str:
     mins = task_display_minutes(task, routine)
     lines = []
-    lines.append(f"Окна для задачи (id={task.id}): {task.title} — {mins}м")
-    lines.append(f"Дата: {day.isoformat()}\n")
+    lines.append(f"Time slots for task (id={task.id}): {task.title} ~ {mins} min")
+    lines.append(f"Date: {day.isoformat()}\n")
 
     if not gaps:
-        lines.append("Свободных окон нет.")
+        lines.append("No free slots in this window.")
         return "\n".join(lines)
 
-    lines.append("Выбери окно и поставь командой:")
-    lines.append(f"/place {task.id} <окно#> [HH:MM]\n")
+    lines.append("Pick a slot and optional time within it:")
+    lines.append(f"/place {task.id} <slot#> [HH:MM]\n")
 
     for idx, g in enumerate(gaps, start=1):
         if task.kind == "workout":
@@ -179,19 +166,19 @@ def format_gap_options(task, gaps: List[Gap], routine, day: dt.date) -> str:
             earliest = g.start + travel
             latest = g.end - (core + travel)
             fit = latest >= earliest
-            fit_txt = "OK" if fit else "не помещается"
+            fit_txt = "OK" if fit else "does not fit"
             lines.append(
-                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()}м) — "
-                f"старт тренировки можно: {earliest.strftime('%H:%M')}–{latest.strftime('%H:%M')} [{fit_txt}]"
+                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()}m) | "
+                f"start range: {earliest.strftime('%H:%M')}-{latest.strftime('%H:%M')} [{fit_txt}]"
             )
         else:
             core = dt.timedelta(minutes=mins)
             latest = g.end - core
             fit = latest >= g.start
-            fit_txt = "OK" if fit else "не помещается"
+            fit_txt = "OK" if fit else "does not fit"
             lines.append(
-                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()}м) — "
-                f"старт можно: {g.start.strftime('%H:%M')}–{latest.strftime('%H:%M')} [{fit_txt}]"
+                f"{idx}) {g.start.strftime('%H:%M')}-{g.end.strftime('%H:%M')} ({g.duration_minutes()}m) | "
+                f"start range: {g.start.strftime('%H:%M')}-{latest.strftime('%H:%M')} [{fit_txt}]"
             )
 
     return "\n".join(lines)

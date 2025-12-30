@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import datetime as dt
-from typing import Iterable
 
-from sqlalchemy import select, and_, delete
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
-from app.models.user import User
-from app.models.task import Task
 from app.models.routine import RoutineConfig
-from app.schemas.tasks import TaskCreate, TaskUpdate
+from app.models.task import Task
+from app.models.user import User
 from app.schemas.routine import RoutinePatch
+from app.schemas.tasks import TaskCreate, TaskUpdate
+from app.settings import settings
 
 
 def _day_bounds(day: dt.date) -> tuple[dt.datetime, dt.datetime]:
@@ -19,7 +19,7 @@ def _day_bounds(day: dt.date) -> tuple[dt.datetime, dt.datetime]:
     return start, end
 
 
-def get_or_create_user_by_chat_id(db: Session, chat_id: str, timezone: str = "Asia/Almaty") -> User:
+def get_or_create_user_by_chat_id(db: Session, chat_id: str, timezone: str = settings.TZ) -> User:
     user = db.execute(select(User).where(User.telegram_chat_id == str(chat_id))).scalar_one_or_none()
     if user:
         return user
@@ -60,13 +60,13 @@ def get_routine(db: Session, user_id: int) -> RoutineConfig:
 
 def _infer_kind(title: str) -> str:
     t = (title or "").strip().lower()
-    if any(x in t for x in ["трен", "gym", "workout", "зал"]):
+    if any(x in t for x in ["workout", "gym", "training", "lift", "cardio", "run"]):
         return "workout"
-    if any(x in t for x in ["завтрак", "обед", "ужин", "еда", "перекус"]):
+    if any(x in t for x in ["breakfast", "lunch", "dinner", "meal", "eat", "food"]):
         return "meal"
-    if any(x in t for x in ["утрен", "morning", "умы", "старт"]):
+    if any(x in t for x in ["morning", "wake", "wakeup", "wake-up"]):
         return "morning"
-    if any(x in t for x in ["работа", "work", "проект", "дашборд", "код", "dev"]):
+    if any(x in t for x in ["work", "dev", "code", "meeting", "project", "study"]):
         return "work"
     return "other"
 
@@ -82,10 +82,14 @@ def create_task(db: Session, user_id: int, data: TaskCreate) -> Task:
         if existing:
             return existing
 
-    kind = (data.kind or _infer_kind(data.title)).lower()
+    title = data.title.strip()
+    if not title:
+        raise ValueError("title must not be empty")
+
+    kind = (data.kind or _infer_kind(title)).lower()
     task = Task(
         user_id=user_id,
-        title=data.title.strip(),
+        title=title,
         notes=data.notes,
         planned_start=data.planned_start,
         planned_end=data.planned_end,
@@ -94,7 +98,7 @@ def create_task(db: Session, user_id: int, data: TaskCreate) -> Task:
         estimate_minutes=data.estimate_minutes,
         kind=kind,
         task_type="user",
-        schedule_source="manual" if data.planned_start else "manual",
+        schedule_source="manual",
         idempotency_key=data.idempotency_key,
     )
     db.add(task)
@@ -104,13 +108,39 @@ def create_task(db: Session, user_id: int, data: TaskCreate) -> Task:
 
 
 def update_task(db: Session, user_id: int, task_id: int, patch: TaskUpdate) -> Task | None:
+    data = patch.model_dump(exclude_unset=True)
+    return update_task_fields(db, user_id, task_id, **data)
+
+
+def update_task_fields(db: Session, user_id: int, task_id: int, **fields) -> Task | None:
+    allowed = {
+        "title",
+        "notes",
+        "planned_start",
+        "planned_end",
+        "due_at",
+        "priority",
+        "estimate_minutes",
+        "kind",
+        "is_done",
+        "task_type",
+        "anchor_key",
+        "schedule_source",
+        "idempotency_key",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"Unknown task fields: {sorted(unknown)}")
+
     task = db.execute(select(Task).where(and_(Task.id == task_id, Task.user_id == user_id))).scalar_one_or_none()
     if not task:
         return None
-    data = patch.model_dump(exclude_unset=True)
-    if "kind" in data and data["kind"] is not None:
-        data["kind"] = data["kind"].lower()
-    for k, v in data.items():
+
+    if "title" in fields and fields["title"] is not None:
+        fields["title"] = fields["title"].strip()
+    if "kind" in fields and fields["kind"] is not None:
+        fields["kind"] = fields["kind"].lower()
+    for k, v in fields.items():
         setattr(task, k, v)
     db.add(task)
     db.commit()
@@ -161,6 +191,25 @@ def list_backlog(db: Session, user_id: int) -> list[Task]:
                 )
             )
             .order_by(Task.priority.asc(), Task.created_at.asc(), Task.id.asc())
+        ).scalars()
+    )
+
+
+def list_tasks_for_day(db: Session, user_id: int, day: dt.date) -> list[Task]:
+    start, end = _day_bounds(day)
+    return list(
+        db.execute(
+            select(Task)
+            .where(
+                and_(
+                    Task.user_id == user_id,
+                    or_(
+                        and_(Task.planned_start >= start, Task.planned_start < end),
+                        Task.planned_start.is_(None),
+                    ),
+                )
+            )
+            .order_by(Task.planned_start.asc(), Task.priority.asc(), Task.created_at.asc(), Task.id.asc())
         ).scalars()
     )
 

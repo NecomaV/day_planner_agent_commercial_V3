@@ -6,11 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.api.deps import get_user_id
+from app.api.deps import get_user_id, require_api_key
 from app.schemas.tasks import TaskCreate, TaskOut, TaskUpdate, PlanOut
 from app import crud
 
-router = APIRouter(prefix="/tasks", tags=["tasks"])
+router = APIRouter(prefix="/tasks", tags=["tasks"], dependencies=[Depends(require_api_key)])
 
 
 @router.post("", response_model=TaskOut)

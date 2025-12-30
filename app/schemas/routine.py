@@ -1,6 +1,22 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+import re
+
+from pydantic import BaseModel, Field, field_validator
+
+
+_HHMM_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _validate_hhmm(v: str | None) -> str | None:
+    if v is None:
+        return v
+    if not _HHMM_RE.match(v):
+        raise ValueError("time must be HH:MM")
+    hh, mm = v.split(":")
+    if int(hh) > 23 or int(mm) > 59:
+        raise ValueError("time must be HH:MM")
+    return v
 
 
 class RoutineOut(BaseModel):
@@ -56,3 +72,21 @@ class RoutinePatch(BaseModel):
     workout_end_window: str | None = None
     workout_rest_days: int | None = Field(default=None, ge=0, le=7)
     workout_no_sunday: bool | None = None
+
+    @field_validator(
+        "sleep_target_bedtime",
+        "sleep_target_wakeup",
+        "sleep_latest_bedtime",
+        "sleep_earliest_wakeup",
+        "breakfast_window_start",
+        "breakfast_window_end",
+        "lunch_window_start",
+        "lunch_window_end",
+        "dinner_window_start",
+        "dinner_window_end",
+        "workout_start_window",
+        "workout_end_window",
+    )
+    @classmethod
+    def _time_fields(cls, v: str | None) -> str | None:
+        return _validate_hhmm(v)

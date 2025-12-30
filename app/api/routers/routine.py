@@ -4,11 +4,11 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.api.deps import get_user_id
+from app.api.deps import get_user_id, require_api_key
 from app.schemas.routine import RoutineOut, RoutinePatch
 from app import crud
 
-router = APIRouter(prefix="/routine", tags=["routine"])
+router = APIRouter(prefix="/routine", tags=["routine"], dependencies=[Depends(require_api_key)])
 
 
 @router.get("", response_model=RoutineOut)

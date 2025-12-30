@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
-"""run_telegram_bot.py
-
-Telegram bot entrypoint.
+"""Telegram bot entrypoint.
 
 Loads environment variables from .env automatically (project root).
 """
@@ -10,18 +7,16 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import os
-from typing import Optional
 from contextlib import contextmanager
 from pathlib import Path
-
-from dotenv import load_dotenv  # <-- IMPORTANT
+from typing import Optional
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from app import crud
 from app.db import SessionLocal
+from app.schemas.tasks import TaskCreate
 from app.settings import settings
 from app.services.autoplan import autoplan_days, ensure_day_anchors
 from app.services.slots import (
@@ -34,14 +29,8 @@ from app.services.slots import (
     task_display_minutes,
 )
 
-# ----------------------------
-# .env loading (robust)
-# ----------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
 ENV_PATH = PROJECT_ROOT / ".env"
-load_dotenv(dotenv_path=ENV_PATH, override=False)
-# Fallback: also try current working directory (sometimes user launches from another folder)
-load_dotenv(override=False)
 
 
 @contextmanager
@@ -61,6 +50,12 @@ def _now_local_naive() -> dt.datetime:
     return dt.datetime.now().replace(microsecond=0)
 
 
+def _idempotency_key(update: Update) -> Optional[str]:
+    if not update.message or not update.effective_chat:
+        return None
+    return f"tg:{update.effective_chat.id}:{update.message.message_id}"
+
+
 async def _get_user(update: Update, db):
     chat_id = update.effective_chat.id
     return crud.get_or_create_user_by_chat_id(db, chat_id=chat_id)
@@ -68,18 +63,18 @@ async def _get_user(update: Update, db):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = (
-        "Day Planner Agent готов.\n\n"
-        "Команды:\n"
-        "/me — показать ваш user_id\n"
-        "/todo <минуты> <текст> — создать задачу без времени\n"
-        "/plan [YYYY-MM-DD] — показать план\n"
-        "/autoplan <дней> [YYYY-MM-DD] — разложить бэклог\n"
-        "/slots <id> [YYYY-MM-DD] — показать окна для задачи\n"
-        "/place <id> <окно#> [HH:MM] — поставить задачу\n"
-        "/schedule <id> <HH:MM> [YYYY-MM-DD] — поставить по точному времени\n"
-        "/unschedule <id> — убрать время (в бэклог)\n"
-        "/done <id> — отметить выполненной\n"
-        "/delete <id> — удалить\n"
+        "Day Planner Agent.\n\n"
+        "Commands:\n"
+        "/me - show user_id\n"
+        "/todo <minutes> <text> - create a backlog task\n"
+        "/plan [YYYY-MM-DD] - show plan\n"
+        "/autoplan <days> [YYYY-MM-DD] - schedule backlog\n"
+        "/slots <id> [YYYY-MM-DD] - show slots for a task\n"
+        "/place <id> <slot#> [HH:MM] - place into a slot\n"
+        "/schedule <id> <HH:MM> [YYYY-MM-DD] - schedule by time\n"
+        "/unschedule <id> - move back to backlog\n"
+        "/done <id> - mark done\n"
+        "/delete <id> - delete task\n"
     )
     await update.message.reply_text(msg)
 
@@ -87,18 +82,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
         user = await _get_user(update, db)
+        api_key_hint = " (X-API-Key required)" if settings.API_KEY else ""
         await update.message.reply_text(
-            "Ваш профиль:\n"
+            "User info:\n"
             f"- user_id: {user.id}\n"
             f"- telegram_chat_id: {user.telegram_chat_id}\n"
-            f"- timezone: {settings.DEFAULT_TIMEZONE}\n\n"
-            "Для Swagger/API используйте заголовок: X-User-Id = ваш user_id"
+            f"- timezone: {settings.TZ}\n\n"
+            f"API header: X-User-Id = user_id{api_key_hint}"
         )
 
 
 def _render_day_plan(tasks, backlog, day: dt.date, routine) -> str:
     lines = []
-    lines.append(f"План на сегодня ({day.isoformat()}):\n")
+    lines.append(f"Plan for {day.isoformat()}:\n")
 
     if tasks:
         for i, t in enumerate(tasks, start=1):
@@ -106,33 +102,33 @@ def _render_day_plan(tasks, backlog, day: dt.date, routine) -> str:
             e = t.planned_end.strftime("%H:%M")
             extra = ""
             if t.kind == "workout":
-                extra = f"  (дорога: {routine.workout_travel_oneway_min}м в одну сторону)"
-            icon = ""
-            if t.kind == "meal":
-                icon = "🍽 "
-            elif t.kind == "morning":
-                icon = "🧼 "
-
-            status = "✅" if t.is_done else "⏳"
-            lines.append(
-                f"{status} {i}) {s}-{e} {icon}{t.title} (id={t.id}){extra}"
-            )
+                extra = f" (travel buffer: {routine.workout_travel_oneway_min}m each way)"
+            tag = f" [{t.kind}]" if t.kind else ""
+            status = "[x]" if t.is_done else "[ ]"
+            lines.append(f"{status} {i}) {s}-{e} {t.title}{tag} (id={t.id}){extra}")
     else:
-        lines.append("(пока пусто)")
+        lines.append("(no scheduled tasks)")
 
     if backlog:
-        lines.append("\nБэклог (без времени):")
+        lines.append("\nBacklog:")
         for i, t in enumerate(backlog, start=1):
             mins = task_display_minutes(t, routine)
-            lines.append(f"⏳ {i}) {t.title} — {mins}м (id={t.id})")
-        lines.append("\nЧтобы разложить бэклог по времени: /autoplan 1")
+            lines.append(f"[ ] {i}) {t.title} ~ {mins}m (id={t.id})")
+        lines.append("\nTip: /autoplan 1")
 
     return "\n".join(lines)
 
 
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     date_arg = context.args[0] if context.args else None
-    day = normalize_date_str(date_arg) if date_arg else _now_local_naive().date()
+    if date_arg:
+        try:
+            day = normalize_date_str(date_arg)
+        except ValueError:
+            await update.message.reply_text("Date must be YYYY-MM-DD")
+            return
+    else:
+        day = _now_local_naive().date()
 
     with get_db_session() as db:
         user = await _get_user(update, db)
@@ -149,25 +145,23 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await update.message.reply_text("Формат: /todo <минуты> <текст>")
+        await update.message.reply_text("Usage: /todo <minutes> <text>")
         return
 
     try:
         estimate = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("Минуты должны быть числом. Пример: /todo 30 позвонить")
+        await update.message.reply_text("Minutes must be a number. Example: /todo 30 review inbox")
         return
 
     title = " ".join(context.args[1:]).strip()
     if not title:
-        await update.message.reply_text("Укажите текст задачи.")
+        await update.message.reply_text("Title cannot be empty.")
         return
 
     with get_db_session() as db:
         user = await _get_user(update, db)
-        task = crud.create_task(
-            db,
-            user_id=user.id,
+        payload = TaskCreate(
             title=title,
             notes=None,
             estimate_minutes=estimate,
@@ -176,105 +170,106 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             due_at=None,
             priority=2,
             kind=None,
-            task_type="user",
-            anchor_key=None,
-            request_id=None,
-            schedule_source="manual",
+            idempotency_key=_idempotency_key(update),
         )
-        await update.message.reply_text(f"Ок. Создал задачу (id={task.id}) в бэклог.")
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        await update.message.reply_text(f"Created. Task id={task.id} added to backlog.")
 
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Формат: /done <id>")
+        await update.message.reply_text("Usage: /done <id>")
         return
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id должен быть числом")
+        await update.message.reply_text("id must be an integer")
         return
 
     with get_db_session() as db:
         user = await _get_user(update, db)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Задача не найдена")
+            await update.message.reply_text("Task not found")
             return
 
-        crud.update_task(db, user.id, task_id, is_done=True, schedule_source="manual")
-        await update.message.reply_text(f"✅ Готово: (id={task_id})")
+        crud.update_task_fields(db, user.id, task_id, is_done=True, schedule_source="manual")
+        await update.message.reply_text(f"Done: (id={task_id})")
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Формат: /delete <id>")
+        await update.message.reply_text("Usage: /delete <id>")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id должен быть числом")
+        await update.message.reply_text("id must be an integer")
         return
 
     with get_db_session() as db:
         user = await _get_user(update, db)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Задача не найдена")
+            await update.message.reply_text("Task not found")
             return
 
         crud.delete_task(db, user.id, task_id)
-        await update.message.reply_text(f"🗑 Удалил (id={task_id})")
+        await update.message.reply_text(f"Deleted (id={task_id})")
 
 
 async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Формат: /unschedule <id>")
+        await update.message.reply_text("Usage: /unschedule <id>")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("id должен быть числом")
+        await update.message.reply_text("id must be an integer")
         return
 
     with get_db_session() as db:
         user = await _get_user(update, db)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Задача не найдена")
+            await update.message.reply_text("Task not found")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Нельзя убирать время у якорей/системных задач.")
+            await update.message.reply_text("Only user tasks can be unscheduled.")
             return
 
-        crud.update_task(db, user.id, task_id, planned_start=None, planned_end=None, schedule_source="manual")
-        await update.message.reply_text(f"Ок. Перенёс в бэклог (id={task_id}).")
+        crud.update_task_fields(db, user.id, task_id, planned_start=None, planned_end=None, schedule_source="manual")
+        await update.message.reply_text(f"Moved to backlog (id={task_id}).")
 
 
 async def cmd_autoplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Формат: /autoplan <дней> [YYYY-MM-DD]")
+        await update.message.reply_text("Usage: /autoplan <days> [YYYY-MM-DD]")
         return
 
     try:
         days = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("дней должно быть числом")
+        await update.message.reply_text("days must be an integer")
         return
 
     start_date = None
     if len(context.args) >= 2:
-        start_date = normalize_date_str(context.args[1])
+        try:
+            start_date = normalize_date_str(context.args[1])
+        except ValueError:
+            await update.message.reply_text("Date must be YYYY-MM-DD")
+            return
 
     with get_db_session() as db:
         user = await _get_user(update, db)
         routine = crud.get_routine(db, user.id)
         result = autoplan_days(db, user.id, routine, days=days, start_date=start_date)
 
-    await update.message.reply_text(
-        f"Готово. Autoplan: {result}\nПроверь план: /plan" + (f" {start_date.isoformat()}" if start_date else "")
-    )
+    suffix = f" {start_date.isoformat()}" if start_date else ""
+    await update.message.reply_text(f"Autoplan complete: {result}\nPlan: /plan{suffix}")
 
 
 def _gaps_for_day(db, user_id: int, day: dt.date, routine):
@@ -293,13 +288,13 @@ def _gaps_for_day(db, user_id: int, day: dt.date, routine):
 
 async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Формат: /slots <task_id> [YYYY-MM-DD]")
+        await update.message.reply_text("Usage: /slots <task_id> [YYYY-MM-DD]")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("task_id должен быть числом")
+        await update.message.reply_text("task_id must be an integer")
         return
 
     date_arg = context.args[1] if len(context.args) >= 2 else None
@@ -309,13 +304,20 @@ async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Задача не найдена")
+            await update.message.reply_text("Task not found")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Это якорь/системная задача. Для неё окна не нужны.")
+            await update.message.reply_text("Only user tasks can be scheduled via /slots.")
             return
 
-        day = normalize_date_str(date_arg) if date_arg else (task.planned_start.date() if task.planned_start else _now_local_naive().date())
+        if date_arg:
+            try:
+                day = normalize_date_str(date_arg)
+            except ValueError:
+                await update.message.reply_text("Date must be YYYY-MM-DD")
+                return
+        else:
+            day = task.planned_start.date() if task.planned_start else _now_local_naive().date()
 
         gaps, _, _ = _gaps_for_day(db, user.id, day, routine)
         text = format_gap_options(task, gaps, routine, day)
@@ -325,14 +327,14 @@ async def cmd_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await update.message.reply_text("Формат: /place <task_id> <slot#> [HH:MM]")
+        await update.message.reply_text("Usage: /place <task_id> <slot#> [HH:MM]")
         return
 
     try:
         task_id = int(context.args[0])
         slot_idx = int(context.args[1])
     except ValueError:
-        await update.message.reply_text("task_id и slot# должны быть числами")
+        await update.message.reply_text("task_id and slot# must be integers")
         return
 
     hhmm = context.args[2] if len(context.args) >= 3 else None
@@ -342,17 +344,17 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Задача не найдена")
+            await update.message.reply_text("Task not found")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Нельзя переносить якоря/системные задачи.")
+            await update.message.reply_text("Only user tasks can be scheduled via /place.")
             return
 
         day = task.planned_start.date() if task.planned_start else _now_local_naive().date()
 
         gaps, _, _ = _gaps_for_day(db, user.id, day, routine)
         if slot_idx < 1 or slot_idx > len(gaps):
-            await update.message.reply_text("Неверный номер окна. Посмотри: /slots <id>")
+            await update.message.reply_text("Invalid slot index. Use /slots <id>.")
             return
 
         gap = gaps[slot_idx - 1]
@@ -369,7 +371,7 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             latest = gap.end - core
 
         if latest < earliest:
-            await update.message.reply_text("В это окно задача не помещается. Посмотри другие окна: /slots")
+            await update.message.reply_text("This slot cannot fit the task. Use /slots again.")
             return
 
         start = earliest
@@ -377,31 +379,31 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 t = parse_hhmm(hhmm)
             except Exception:
-                await update.message.reply_text("Время должно быть в формате HH:MM, например 21:30")
+                await update.message.reply_text("Time must be HH:MM, e.g. 21:30")
                 return
             candidate = dt.datetime.combine(day, t)
             if candidate < earliest or candidate > latest:
                 await update.message.reply_text(
-                    f"Это время не подходит. Допустимый диапазон старта в этом окне: {earliest.strftime('%H:%M')}–{latest.strftime('%H:%M')}"
+                    f"Time outside slot. Use {earliest.strftime('%H:%M')}-{latest.strftime('%H:%M')}"
                 )
                 return
             start = candidate
 
         end = start + core
-        crud.update_task(db, user.id, task_id, planned_start=start, planned_end=end, schedule_source="manual")
+        crud.update_task_fields(db, user.id, task_id, planned_start=start, planned_end=end, schedule_source="manual")
 
-    await update.message.reply_text(f"Ок. Поставил: (id={task_id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})")
+    await update.message.reply_text(f"Scheduled (id={task_id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})")
 
 
 async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if len(context.args) < 2:
-        await update.message.reply_text("Формат: /schedule <task_id> <HH:MM> [YYYY-MM-DD]")
+        await update.message.reply_text("Usage: /schedule <task_id> <HH:MM> [YYYY-MM-DD]")
         return
 
     try:
         task_id = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("task_id должен быть числом")
+        await update.message.reply_text("task_id must be an integer")
         return
 
     hhmm = context.args[1]
@@ -412,18 +414,25 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         routine = crud.get_routine(db, user.id)
         task = crud.get_task(db, user.id, task_id)
         if not task:
-            await update.message.reply_text("Задача не найдена")
+            await update.message.reply_text("Task not found")
             return
         if task.task_type != "user":
-            await update.message.reply_text("Нельзя переносить якоря/системные задачи.")
+            await update.message.reply_text("Only user tasks can be scheduled via /schedule.")
             return
 
-        day = normalize_date_str(date_arg) if date_arg else (task.planned_start.date() if task.planned_start else _now_local_naive().date())
+        if date_arg:
+            try:
+                day = normalize_date_str(date_arg)
+            except ValueError:
+                await update.message.reply_text("Date must be YYYY-MM-DD")
+                return
+        else:
+            day = task.planned_start.date() if task.planned_start else _now_local_naive().date()
 
         try:
             t = parse_hhmm(hhmm)
         except Exception:
-            await update.message.reply_text("Время должно быть HH:MM")
+            await update.message.reply_text("Time must be HH:MM")
             return
 
         desired_start = dt.datetime.combine(day, t)
@@ -448,17 +457,17 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 break
 
         if not ok:
-            await update.message.reply_text("В это время поставить нельзя (пересечение или вне окон). Посмотри /slots <id>.")
+            await update.message.reply_text("Time does not fit available slots. Use /slots <id>.")
             return
 
         end = desired_start + core
-        crud.update_task(db, user.id, task_id, planned_start=desired_start, planned_end=end, schedule_source="manual")
+        crud.update_task_fields(db, user.id, task_id, planned_start=desired_start, planned_end=end, schedule_source="manual")
 
-    await update.message.reply_text(f"Ок. Поставил: (id={task_id}) {desired_start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})")
+    await update.message.reply_text(f"Scheduled (id={task_id}) {desired_start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})")
 
 
 def main() -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    token = settings.TELEGRAM_BOT_TOKEN
     if not token:
         # Helpful diagnostics
         hint = (

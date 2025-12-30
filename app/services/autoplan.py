@@ -1,24 +1,10 @@
-# -*- coding: utf-8 -*-
-"""app/services/autoplan.py
-
-Autoplan service.
-
-Key rules (commercial-friendly):
-- Uses routine anchors (morning start + meals) as hard constraints.
-- Does not schedule new tasks before the end of the morning block.
-- For "today", does not schedule new tasks in the past: earliest start = max(morning_end, now).
-- Uses consistent "busy" logic:
-  * meal anchors reserve extra buffer after the meal
-  * workout tasks reserve travel before/after the in-gym block
-"""
-
 from __future__ import annotations
 
 import datetime as dt
 from typing import Dict, List, Optional, Tuple
 
 from app import crud
-from app.services.slots import day_bounds, build_busy_intervals, gaps_from_busy, Interval
+from app.services.slots import Interval, build_busy_intervals, day_bounds, gaps_from_busy
 
 
 def _find_first_fit_start(
@@ -44,47 +30,15 @@ def _now_local_naive() -> dt.datetime:
     return dt.datetime.now().replace(microsecond=0)
 
 
-def upsert_anchor(
-    db,
-    user_id: int,
-    *,
-    anchor_key: str,
-    title: str,
-    kind: str,
-    start: dt.datetime,
-    end: dt.datetime,
-) -> None:
-    existing = crud.get_anchor_by_key(db, user_id=user_id, anchor_key=anchor_key)
-    if existing:
-        crud.update_task(
-            db,
-            user_id,
-            existing.id,
-            title=title,
-            kind=kind,
-            planned_start=start,
-            planned_end=end,
-            task_type="anchor",
-            schedule_source="anchor",
-            estimate_minutes=int((end - start).total_seconds() // 60),
-        )
-    else:
-        crud.create_task(
-            db,
-            user_id=user_id,
-            title=title,
-            notes=None,
-            estimate_minutes=int((end - start).total_seconds() // 60),
-            planned_start=start,
-            planned_end=end,
-            due_at=None,
-            priority=0,
-            kind=kind,
-            task_type="anchor",
-            anchor_key=anchor_key,
-            request_id=None,
-            schedule_source="anchor",
-        )
+def _has_recent_workout(db, user_id: int, day: dt.date, rest_days: int) -> bool:
+    if rest_days <= 0:
+        return False
+    for offset in range(1, rest_days + 1):
+        prev_day = day - dt.timedelta(days=offset)
+        tasks = crud.list_scheduled_for_day(db, user_id, prev_day)
+        if any(t.kind == "workout" for t in tasks):
+            return True
+    return False
 
 
 def ensure_day_anchors(db, user_id: int, day: dt.date, routine) -> None:
@@ -94,34 +48,32 @@ def ensure_day_anchors(db, user_id: int, day: dt.date, routine) -> None:
     in the internal busy timeline.
     """
     now = _now_local_naive()
-    day_start, day_end, morning_start, morning_end = day_bounds(day, routine, now=now)
+    day_start, _day_end, morning_start, morning_end = day_bounds(day, routine, now=now)
 
     # Base busy: already scheduled tasks (including existing anchors)
-    tasks = crud.list_tasks_for_day(db, user_id, day)
-    scheduled = [t for t in tasks if t.planned_start and not t.is_done]
+    scheduled = crud.list_scheduled_for_day(db, user_id, day)
     busy = build_busy_intervals(scheduled, routine)
 
     # Morning anchor is fixed at wake time.
-    upsert_anchor(
+    crud.upsert_anchor(
         db,
         user_id,
         anchor_key="morning_start",
-        title="Утренний старт",
+        title="Morning start",
         kind="morning",
-        start=morning_start,
-        end=morning_end,
+        planned_start=morning_start,
+        planned_end=morning_end,
     )
 
     # After inserting morning, refresh busy
-    tasks = crud.list_tasks_for_day(db, user_id, day)
-    scheduled = [t for t in tasks if t.planned_start and not t.is_done]
+    scheduled = crud.list_scheduled_for_day(db, user_id, day)
     busy = build_busy_intervals(scheduled, routine)
 
     # Meals: find first fit within their window, reserving meal buffer after.
     meal_defs = [
-        ("breakfast", "🍽 Завтрак", routine.breakfast_window_start, routine.breakfast_window_end, routine.meal_duration_min),
-        ("lunch", "🍽 Обед", routine.lunch_window_start, routine.lunch_window_end, routine.meal_duration_min),
-        ("dinner", "🍽 Ужин", routine.dinner_window_start, routine.dinner_window_end, routine.meal_duration_min),
+        ("breakfast", "Breakfast", routine.breakfast_window_start, routine.breakfast_window_end, routine.meal_duration_min),
+        ("lunch", "Lunch", routine.lunch_window_start, routine.lunch_window_end, routine.meal_duration_min),
+        ("dinner", "Dinner", routine.dinner_window_start, routine.dinner_window_end, routine.meal_duration_min),
     ]
 
     for key, title, w_start, w_end, dur_min in meal_defs:
@@ -138,14 +90,14 @@ def ensure_day_anchors(db, user_id: int, day: dt.date, routine) -> None:
 
         start = slot
         end = start + dt.timedelta(minutes=dur_min)
-        upsert_anchor(
+        crud.upsert_anchor(
             db,
             user_id,
             anchor_key=key,
             title=title,
             kind="meal",
-            start=start,
-            end=end,
+            planned_start=start,
+            planned_end=end,
         )
 
         # Reserve busy including meal buffer
@@ -155,7 +107,6 @@ def ensure_day_anchors(db, user_id: int, day: dt.date, routine) -> None:
                 end=end + dt.timedelta(minutes=routine.meal_buffer_after_min),
             )
         )
-        # merge
         busy = build_busy_intervals(
             crud.list_scheduled_for_day(db, user_id, day),
             routine,
@@ -198,16 +149,25 @@ def autoplan_days(
             if task.is_done:
                 continue
 
-            # Recompute gaps each time (simple & robust)
+            is_workout = task.kind == "workout"
+            if is_workout:
+                if not routine.workout_enabled:
+                    continue
+                if routine.workout_no_sunday and day.weekday() == 6:
+                    continue
+                if _has_recent_workout(db, user_id, day, routine.workout_rest_days):
+                    continue
+
+            # Recompute gaps each time (simple and robust)
             gaps = gaps_from_busy(busy, day_start, day_end)
             gap_tuples = _gap_tuples(gaps)
 
-            if task.kind == "workout":
+            if is_workout:
                 travel = dt.timedelta(minutes=routine.workout_travel_oneway_min)
                 core = dt.timedelta(minutes=max(task.estimate_minutes, routine.workout_block_min))
                 total = core + travel + travel
 
-                # depart time must fit within gaps
+                # Depart time must fit within gaps
                 depart = _find_first_fit_start(
                     gap_tuples,
                     duration=total,
@@ -219,7 +179,7 @@ def autoplan_days(
                 in_gym_start = depart + travel
                 in_gym_end = in_gym_start + core
 
-                crud.update_task(
+                crud.update_task_fields(
                     db,
                     user_id,
                     task.id,
@@ -241,7 +201,7 @@ def autoplan_days(
                 continue
 
             end = start + dur
-            crud.update_task(
+            crud.update_task_fields(
                 db,
                 user_id,
                 task.id,
@@ -255,7 +215,11 @@ def autoplan_days(
             placed += 1
 
         results.append(
-            {"date": day.isoformat(), "anchors": len([t for t in scheduled_today if t.task_type == "anchor"]), "scheduled": placed}
+            {
+                "date": day.isoformat(),
+                "anchors": len([t for t in scheduled_today if t.task_type == "anchor"]),
+                "scheduled": placed,
+            }
         )
 
     return results

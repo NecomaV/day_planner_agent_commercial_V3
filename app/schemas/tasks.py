@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 TASK_TYPE_VALUES = {"user", "anchor", "system"}
@@ -32,10 +32,24 @@ class TaskCreate(BaseModel):
     kind: str | None = Field(default=None, description="meal|workout|morning|work|other")
     idempotency_key: str | None = Field(default=None, max_length=120)
 
+    @field_validator("title")
+    @classmethod
+    def _title(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("title must not be empty")
+        return v
+
     @field_validator("kind")
     @classmethod
     def _kind(cls, v: str | None) -> str | None:
         return _validate_enum_str(v, TASK_KIND_VALUES, "kind")
+
+    @model_validator(mode="after")
+    def _validate_times(self) -> "TaskCreate":
+        if self.planned_start and self.planned_end and self.planned_end <= self.planned_start:
+            raise ValueError("planned_end must be after planned_start")
+        return self
 
 
 class TaskUpdate(BaseModel):
@@ -52,10 +66,26 @@ class TaskUpdate(BaseModel):
 
     kind: str | None = Field(default=None, description="meal|workout|morning|work|other")
 
+    @field_validator("title")
+    @classmethod
+    def _title(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip()
+        if not v:
+            raise ValueError("title must not be empty")
+        return v
+
     @field_validator("kind")
     @classmethod
     def _kind(cls, v: str | None) -> str | None:
         return _validate_enum_str(v, TASK_KIND_VALUES, "kind")
+
+    @model_validator(mode="after")
+    def _validate_times(self) -> "TaskUpdate":
+        if self.planned_start and self.planned_end and self.planned_end <= self.planned_start:
+            raise ValueError("planned_end must be after planned_start")
+        return self
 
 
 class TaskOut(BaseModel):
