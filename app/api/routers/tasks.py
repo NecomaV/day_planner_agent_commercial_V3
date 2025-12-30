@@ -1,0 +1,59 @@
+from __future__ import annotations
+
+import datetime as dt
+from fastapi import APIRouter, Depends, HTTPException, Query
+
+from sqlalchemy.orm import Session
+
+from app.db import get_db
+from app.api.deps import get_user_id
+from app.schemas.tasks import TaskCreate, TaskOut, TaskUpdate, PlanOut
+from app import crud
+
+router = APIRouter(prefix="/tasks", tags=["tasks"])
+
+
+@router.post("", response_model=TaskOut)
+def create_task(payload: TaskCreate, db: Session = Depends(get_db), user_id: int = Depends(get_user_id)):
+    return crud.create_task(db, user_id, payload)
+
+
+@router.get("/day", response_model=list[TaskOut])
+def list_day(
+    date: dt.date = Query(..., description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_user_id),
+):
+    return crud.list_scheduled_for_day(db, user_id, date)
+
+
+@router.get("/backlog", response_model=list[TaskOut])
+def list_backlog(db: Session = Depends(get_db), user_id: int = Depends(get_user_id)):
+    return crud.list_backlog(db, user_id)
+
+
+@router.get("/plan", response_model=PlanOut)
+def get_plan(
+    date: dt.date = Query(..., description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_user_id),
+):
+    scheduled = crud.list_scheduled_for_day(db, user_id, date)
+    backlog = crud.list_backlog(db, user_id)
+    return PlanOut(date=date.isoformat(), scheduled=scheduled, backlog=backlog)
+
+
+@router.patch("/{task_id}", response_model=TaskOut)
+def patch_task(task_id: int, payload: TaskUpdate, db: Session = Depends(get_db), user_id: int = Depends(get_user_id)):
+    t = crud.update_task(db, user_id, task_id, payload)
+    if not t:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return t
+
+
+@router.delete("/{task_id}")
+def delete_task(task_id: int, db: Session = Depends(get_db), user_id: int = Depends(get_user_id)):
+    ok = crud.delete_task(db, user_id, task_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"ok": True}
