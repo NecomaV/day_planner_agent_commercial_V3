@@ -78,6 +78,41 @@ def _extract_task_ids(text: str) -> list[int]:
     return [int(x) for x in re.findall(r"\b\d+\b", text)]
 
 
+def _looks_like_greeting(text: str) -> bool:
+    lower = re.sub(r"[^\w\s]", "", text.strip().lower())
+    return lower in {
+        "привет",
+        "приветик",
+        "здравствуй",
+        "здравствуйте",
+        "добрый день",
+        "доброе утро",
+        "добрый вечер",
+        "hi",
+        "hello",
+        "hey",
+    }
+
+
+def _should_create_task(text: str) -> bool:
+    lower = text.lower()
+    triggers = [
+        "создай задачу",
+        "добавь задачу",
+        "добавить задачу",
+        "поставь задачу",
+        "задача:",
+        "сделать:",
+        "нужно сделать",
+        "надо сделать",
+        "напомни",
+        "напомнить",
+        "todo",
+        "task",
+    ]
+    return any(t in lower for t in triggers)
+
+
 def _parse_weekday(value: str) -> int | None:
     value = value.strip().lower()
     mapping = {
@@ -318,27 +353,50 @@ async def _prompt_task_selection(action: str, update: Update, context: ContextTy
     await update.message.reply_text("\n".join(lines))
 
 
-async def _apply_task_action(action: str, task_id: int, update: Update, db, user) -> bool:
-    task = crud.get_task(db, user.id, task_id)
-    if not task:
-        await update.message.reply_text("Задача не найдена")
+async def _apply_task_actions(action: str, task_ids: list[int], update: Update, db, user) -> bool:
+    if not task_ids:
         return False
-    if action == "delete":
-        crud.delete_task(db, user.id, task_id)
-        await update.message.reply_text(f"Удалено (id={task_id})")
-        return True
-    if action == "done":
-        crud.update_task_fields(db, user.id, task_id, is_done=True, schedule_source="manual")
-        await update.message.reply_text(f"Готово (id={task_id})")
-        return True
-    if action == "unschedule":
-        if task.task_type != "user":
-            await update.message.reply_text("Только пользовательские задачи можно убирать из расписания.")
-            return True
-        crud.update_task_fields(db, user.id, task_id, planned_start=None, planned_end=None, schedule_source="manual")
-        await update.message.reply_text(f"Перемещено в бэклог (id={task_id}).")
-        return True
-    return False
+    deleted: list[int] = []
+    done: list[int] = []
+    unscheduled: list[int] = []
+    skipped: list[int] = []
+
+    for task_id in task_ids:
+        task = crud.get_task(db, user.id, task_id)
+        if not task:
+            skipped.append(task_id)
+            continue
+        if action == "delete":
+            crud.delete_task(db, user.id, task_id)
+            deleted.append(task_id)
+            continue
+        if action == "done":
+            crud.update_task_fields(db, user.id, task_id, is_done=True, schedule_source="manual")
+            done.append(task_id)
+            continue
+        if action == "unschedule":
+            if task.task_type != "user":
+                skipped.append(task_id)
+                continue
+            crud.update_task_fields(db, user.id, task_id, planned_start=None, planned_end=None, schedule_source="manual")
+            unscheduled.append(task_id)
+            continue
+
+    parts = []
+    if deleted:
+        parts.append(f"Удалено: {', '.join(str(i) for i in deleted)}")
+    if done:
+        parts.append(f"Готово: {', '.join(str(i) for i in done)}")
+    if unscheduled:
+        parts.append(f"Перемещено в бэклог: {', '.join(str(i) for i in unscheduled)}")
+    if skipped:
+        parts.append(f"Пропущено: {', '.join(str(i) for i in skipped)}")
+
+    if not parts:
+        await update.message.reply_text("Задачи не найдены.")
+        return False
+    await update.message.reply_text("\n".join(parts))
+    return True
 
 
 async def _handle_pending_action(
@@ -361,13 +419,12 @@ async def _handle_pending_action(
     if not ids:
         await update.message.reply_text("Пришлите id задачи или напишите «отмена».")
         return True
-    task_id = ids[0]
     candidate_ids = set(pending.get("candidate_ids") or [])
-    if candidate_ids and task_id not in candidate_ids:
+    if candidate_ids and any(task_id not in candidate_ids for task_id in ids):
         await update.message.reply_text("Пожалуйста, выберите id из списка.")
         return True
     context.user_data.pop("pending_action", None)
-    return await _apply_task_action(pending.get("action", ""), task_id, update, db, user)
+    return await _apply_task_actions(pending.get("action", ""), ids, update, db, user)
 
 
 async def _run_command_by_name(
@@ -566,6 +623,7 @@ async def _process_user_text(
     user,
 ) -> None:
     routine = crud.get_routine(db, user.id)
+    ai_enabled = bool(settings.OPENAI_API_KEY)
 
     if await _handle_pending_action(text, update, context, db, user, routine):
         return
@@ -576,11 +634,20 @@ async def _process_user_text(
         if name in {"delete", "done", "unschedule"} and not args:
             await _prompt_task_selection(name, update, context, db, user, routine)
             return
+        if name in {"delete", "done", "unschedule"}:
+            ids = _extract_task_ids(" ".join(args))
+            if ids:
+                await _apply_task_actions(name, ids, update, db, user)
+                return
         handled = await _run_command_by_name(name, args, update, context)
         if handled:
             return
 
-    if settings.OPENAI_API_KEY:
+    if _looks_like_greeting(text):
+        await update.message.reply_text("Привет! Чем помочь?")
+        return
+
+    if ai_enabled:
         data = parse_intent(text, settings.OPENAI_API_KEY, settings.OPENAI_CHAT_MODEL)
         if data:
             handled = await _handle_ai_intent(data, text, update, context, db, user)
@@ -591,7 +658,7 @@ async def _process_user_text(
     if any(word in lower for word in ["удали", "удалить", "delete", "стереть", "убери задачу"]):
         ids = _extract_task_ids(text)
         if ids:
-            await _apply_task_action("delete", ids[0], update, db, user)
+            await _apply_task_actions("delete", ids, update, db, user)
         else:
             await _prompt_task_selection("delete", update, context, db, user, routine)
         return
@@ -599,7 +666,7 @@ async def _process_user_text(
     if any(word in lower for word in ["сделано", "готово", "закрыть", "завершить", "done"]):
         ids = _extract_task_ids(text)
         if ids:
-            await _apply_task_action("done", ids[0], update, db, user)
+            await _apply_task_actions("done", ids, update, db, user)
         else:
             await _prompt_task_selection("done", update, context, db, user, routine)
         return
@@ -607,7 +674,7 @@ async def _process_user_text(
     if any(word in lower for word in ["убери из расписания", "сними с плана", "перенеси в бэклог", "unschedule"]):
         ids = _extract_task_ids(text)
         if ids:
-            await _apply_task_action("unschedule", ids[0], update, db, user)
+            await _apply_task_actions("unschedule", ids, update, db, user)
         else:
             await _prompt_task_selection("unschedule", update, context, db, user, routine)
         return
@@ -665,6 +732,13 @@ async def _process_user_text(
             offset += 10
 
         await update.message.reply_text(f"Добавлено шагов: {len(items)}. Используйте /morning для просмотра.")
+        return
+
+    if not _should_create_task(text):
+        if ai_enabled:
+            await update.message.reply_text("Понял. Хотите создать задачу? Если да, скажите: «создай задачу ...»")
+        else:
+            await update.message.reply_text("Если нужно создать задачу, скажите: «создай задачу ...»")
         return
 
     parsed = parse_quick_task(text, _now_local_naive())
@@ -800,6 +874,11 @@ async def _handle_ai_intent(
             routine = crud.get_routine(db, user.id)
             await _prompt_task_selection(name, update, context, db, user, routine)
             return True
+        if name in {"delete", "done", "unschedule"}:
+            ids = _extract_task_ids(" ".join(str(a) for a in args))
+            if ids:
+                await _apply_task_actions(name, ids, update, db, user)
+                return True
         return await _run_command_by_name(name, [str(a) for a in args], update, context)
 
     if intent == "task":
