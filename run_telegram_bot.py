@@ -22,6 +22,7 @@ from app.db import SessionLocal
 from app.schemas.tasks import TaskCreate
 from app.settings import settings
 from app.services.autoplan import autoplan_days, ensure_day_anchors
+from app.services.ai_chat import chat_reply
 from app.services.ai_transcribe import transcribe_audio
 from app.services.ai_intent import parse_intent, suggest_routine_steps
 from app.services.meal_suggest import suggest_meals
@@ -111,6 +112,51 @@ def _should_create_task(text: str) -> bool:
         "task",
     ]
     return any(t in lower for t in triggers)
+
+
+def _get_chat_history(context: ContextTypes.DEFAULT_TYPE, limit: int = 8) -> list[dict[str, str]]:
+    history = context.user_data.get("chat_history") or []
+    return history[-limit:]
+
+
+def _append_chat_history(context: ContextTypes.DEFAULT_TYPE, role: str, content: str, limit: int = 8) -> None:
+    history = context.user_data.get("chat_history") or []
+    history.append({"role": role, "content": content})
+    context.user_data["chat_history"] = history[-limit:]
+
+
+def _build_assistant_context(db, user) -> str:
+    now = _now_local_naive()
+    routine = crud.get_routine(db, user.id)
+    day = now.date()
+    tasks = crud.list_tasks_for_day(db, user.id, day)
+    scheduled = [t for t in tasks if t.planned_start and not t.is_done]
+    backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
+    scheduled.sort(key=lambda t: t.planned_start)
+
+    lines = [
+        f"Дата и время: {now.strftime('%Y-%m-%d %H:%M')} ({settings.TZ})",
+        f"Цели сна: подъем {routine.sleep_target_wakeup}, сон {routine.sleep_target_bedtime}",
+        f"Запланировано на сегодня: {len(scheduled)}",
+    ]
+    if scheduled:
+        lines.append("Ближайшие задачи:")
+        for t in scheduled[:5]:
+            when = t.planned_start.strftime("%H:%M")
+            lines.append(f"- {when} {t.title} (id={t.id})")
+    lines.append(f"Бэклог: {len(backlog)}")
+    return "\n".join(lines)
+
+
+def _assistant_system_prompt() -> str:
+    return (
+        "Ты — русскоязычный ИИ‑ассистент для бизнеса (в стиле Джарвис), "
+        "помогаешь планировать день, отвечаешь на вопросы, предлагаешь идеи и уточнения. "
+        "Будь кратким, дружелюбным и практичным. "
+        "Если для ответа нужна дополнительная информация, задай уточняющий вопрос. "
+        "Не создавай задачи сам — предложи пользователю сказать: «создай задачу ...», "
+        "если это уместно."
+    )
 
 
 def _parse_weekday(value: str) -> int | None:
@@ -356,6 +402,7 @@ async def _prompt_task_selection(action: str, update: Update, context: ContextTy
 async def _apply_task_actions(action: str, task_ids: list[int], update: Update, db, user) -> bool:
     if not task_ids:
         return False
+    task_ids = list(dict.fromkeys(task_ids))
     deleted: list[int] = []
     done: list[int] = []
     unscheduled: list[int] = []
@@ -736,9 +783,24 @@ async def _process_user_text(
 
     if not _should_create_task(text):
         if ai_enabled:
-            await update.message.reply_text("Понял. Хотите создать задачу? Если да, скажите: «создай задачу ...»")
-        else:
-            await update.message.reply_text("Если нужно создать задачу, скажите: «создай задачу ...»")
+            context_prompt = _build_assistant_context(db, user)
+            history = _get_chat_history(context)
+            reply = chat_reply(
+                text,
+                settings.OPENAI_API_KEY,
+                settings.OPENAI_CHAT_MODEL,
+                system_prompt=_assistant_system_prompt(),
+                context_prompt=context_prompt,
+                history=history,
+            )
+            if reply:
+                _append_chat_history(context, "user", text)
+                _append_chat_history(context, "assistant", reply)
+                await update.message.reply_text(reply)
+                return
+            await update.message.reply_text("Не удалось получить ответ от ИИ. Попробуйте еще раз.")
+            return
+        await update.message.reply_text("Если нужно создать задачу, скажите: «создай задачу ...»")
         return
 
     parsed = parse_quick_task(text, _now_local_naive())
@@ -883,6 +945,8 @@ async def _handle_ai_intent(
 
     if intent == "task":
         text = data.get("text") or original_text
+        if not _should_create_task(original_text):
+            return False
         parsed = parse_quick_task(text, _now_local_naive())
         payload = TaskCreate(
             title=parsed.title,
@@ -1508,11 +1572,10 @@ async def cmd_todo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Использование: /done <id>")
+        await update.message.reply_text("Использование: /done <id> [id2 ...]")
         return
-    try:
-        task_id = int(context.args[0])
-    except ValueError:
+    ids = _extract_task_ids(" ".join(context.args))
+    if not ids:
         await update.message.reply_text("id должен быть числом")
         return
 
@@ -1520,23 +1583,16 @@ async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await _get_ready_user(update, context, db)
         if not user:
             return
-        task = crud.get_task(db, user.id, task_id)
-        if not task:
-            await update.message.reply_text("Задача не найдена")
-            return
-
-        crud.update_task_fields(db, user.id, task_id, is_done=True, schedule_source="manual")
-        await update.message.reply_text(f"Готово (id={task_id})")
+        await _apply_task_actions("done", ids, update, db, user)
 
 
 async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Использование: /delete <id>")
+        await update.message.reply_text("Использование: /delete <id> [id2 ...]")
         return
 
-    try:
-        task_id = int(context.args[0])
-    except ValueError:
+    ids = _extract_task_ids(" ".join(context.args))
+    if not ids:
         await update.message.reply_text("id должен быть числом")
         return
 
@@ -1544,23 +1600,16 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         user = await _get_ready_user(update, context, db)
         if not user:
             return
-        task = crud.get_task(db, user.id, task_id)
-        if not task:
-            await update.message.reply_text("Задача не найдена")
-            return
-
-        crud.delete_task(db, user.id, task_id)
-        await update.message.reply_text(f"Удалено (id={task_id})")
+        await _apply_task_actions("delete", ids, update, db, user)
 
 
 async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Использование: /unschedule <id>")
+        await update.message.reply_text("Использование: /unschedule <id> [id2 ...]")
         return
 
-    try:
-        task_id = int(context.args[0])
-    except ValueError:
+    ids = _extract_task_ids(" ".join(context.args))
+    if not ids:
         await update.message.reply_text("id должен быть числом")
         return
 
@@ -1568,16 +1617,7 @@ async def cmd_unschedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         user = await _get_ready_user(update, context, db)
         if not user:
             return
-        task = crud.get_task(db, user.id, task_id)
-        if not task:
-            await update.message.reply_text("Задача не найдена")
-            return
-        if task.task_type != "user":
-            await update.message.reply_text("Только пользовательские задачи можно убирать из расписания.")
-            return
-
-        crud.update_task_fields(db, user.id, task_id, planned_start=None, planned_end=None, schedule_source="manual")
-        await update.message.reply_text(f"Перемещено в бэклог (id={task_id}).")
+        await _apply_task_actions("unschedule", ids, update, db, user)
 
 
 async def cmd_autoplan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

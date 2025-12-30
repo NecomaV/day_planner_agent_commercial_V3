@@ -44,6 +44,7 @@ def parse_intent(text: str, api_key: str | None, model: str) -> Optional[dict[st
         "plan, autoplan, morning, routine_add, routine_list, routine_del, pantry, breakfast, workout, "
         "cabinet, login, logout, done, delete, unschedule, slots, place, schedule, todo, capture, call. "
         "args must be a JSON array of strings. "
+        "If the user is chatting, greeting, or asking a general question, return {intent: unknown}. "
         "Use the user's language for all text values. "
         "Always return valid JSON. No extra keys."
     )
