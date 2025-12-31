@@ -82,7 +82,8 @@ function taskMatchesFilters(task, filters) {
   if (!filters.showDone && task.is_done) {
     return false;
   }
-  if (filters.kind !== 'all' && task.kind !== filters.kind) {
+  const taskKind = task.kind || 'other';
+  if (filters.kind !== 'all' && taskKind !== filters.kind) {
     return false;
   }
   if (filters.query) {
@@ -120,6 +121,7 @@ function clearSelection() {
   selectedTaskId = null;
   selectedTaskInfo.textContent = 'Выберите задачу в календаре или бэклоге.';
   setActionButtonsEnabled(false);
+  markDoneButton.textContent = 'Готово';
 }
 
 function setActionButtonsEnabled(enabled, task = null) {
@@ -149,6 +151,7 @@ function setSelectedTask(task, element) {
   updateSelectedTaskInfo(task);
   setActionButtonsEnabled(true, task);
   fillMoveInputs(task);
+  markDoneButton.textContent = task.is_done ? 'Вернуть' : 'Готово';
 }
 
 function updateSelectedTaskInfo(task) {
@@ -297,11 +300,16 @@ function registerTask(task) {
 function handleDragStart(event, taskId) {
   event.dataTransfer.effectAllowed = 'move';
   event.dataTransfer.setData('text/plain', String(taskId));
+  try {
+    event.dataTransfer.setData('text/task-id', String(taskId));
+  } catch (err) {
+    // ignore
+  }
 }
 
 async function handleDropOnDay(event, dateStr) {
   event.preventDefault();
-  const taskId = event.dataTransfer.getData('text/plain');
+  const taskId = event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
   if (!taskId) return;
   const task = taskIndex.get(String(taskId));
   if (!task) return;
@@ -329,9 +337,28 @@ async function handleDropOnDay(event, dateStr) {
   });
 }
 
+async function handleDropOnSlot(event, dateStr, timeStr) {
+  event.preventDefault();
+  const taskId = event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
+  if (!taskId) return;
+  const task = taskIndex.get(String(taskId));
+  if (!task) return;
+  const start = parseLocalDateTime(dateStr, timeStr);
+  if (!start) return;
+  const duration = getTaskDurationMinutes(task);
+  const end = new Date(start.getTime() + duration * 60000);
+  await runAction('Перемещаю задачу', async () => {
+    await patchTask(task.id, {
+      planned_start: toLocalIsoString(start),
+      planned_end: toLocalIsoString(end),
+      schedule_source: 'manual',
+    });
+  });
+}
+
 async function handleDropOnBacklog(event) {
   event.preventDefault();
-  const taskId = event.dataTransfer.getData('text/plain');
+  const taskId = event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
   if (!taskId) return;
   const task = taskIndex.get(String(taskId));
   if (!task || !task.planned_start) return;
@@ -346,6 +373,35 @@ function createTitleElement(task, item) {
   title.textContent = task.title;
   title.addEventListener('dblclick', () => startTitleEdit(task, item, title));
   return title;
+}
+
+function createPriorityElement(task) {
+  const pill = document.createElement('button');
+  pill.className = 'priority-pill';
+  pill.type = 'button';
+  pill.dataset.priority = String(task.priority || 2);
+  pill.textContent = `P${task.priority || 2}`;
+  pill.title = 'Нажмите, чтобы сменить приоритет';
+  pill.addEventListener('click', async (event) => {
+    event.stopPropagation();
+    const current = task.priority || 2;
+    const next = current >= 3 ? 1 : current + 1;
+    await runAction('Обновляю приоритет', async () => {
+      await patchTask(task.id, { priority: next });
+    });
+  });
+  return pill;
+}
+
+function createNotesElement(task, item) {
+  const notes = document.createElement('div');
+  notes.className = 'task-notes';
+  notes.textContent = task.notes ? `Заметка: ${task.notes}` : 'Добавить заметку';
+  if (!task.notes) {
+    notes.classList.add('empty');
+  }
+  notes.addEventListener('dblclick', () => startNotesEdit(task, item, notes));
+  return notes;
 }
 
 function createTimeElement(task, item) {
@@ -373,6 +429,11 @@ function renderTask(task, dayDateStr = null) {
     item.appendChild(createTimeElement(task, item));
   }
   item.appendChild(createTitleElement(task, item));
+  const meta = document.createElement('div');
+  meta.className = 'task-meta';
+  meta.appendChild(createPriorityElement(task));
+  meta.appendChild(createNotesElement(task, item));
+  item.appendChild(meta);
   if (task.location_label) {
     const loc = document.createElement('div');
     loc.className = 'task-location';
@@ -480,8 +541,61 @@ function startTimeEdit(task, item, timeEl) {
   });
 }
 
+function startNotesEdit(task, item, notesEl) {
+  if (item.classList.contains('editing')) return;
+  item.classList.add('editing');
+  const textarea = document.createElement('textarea');
+  textarea.className = 'task-edit-notes';
+  textarea.rows = 2;
+  textarea.value = task.notes || '';
+  notesEl.replaceWith(textarea);
+  textarea.focus();
+
+  const finalize = async (save) => {
+    textarea.replaceWith(createNotesElement(task, item));
+    item.classList.remove('editing');
+    if (!save) return;
+    const value = textarea.value.trim();
+    const nextNotes = value.length ? value : null;
+    if ((task.notes || null) === nextNotes) {
+      return;
+    }
+    await runAction('Сохраняю заметку', async () => {
+      await patchTask(task.id, { notes: nextNotes });
+    });
+  };
+
+  textarea.addEventListener('blur', () => finalize(true));
+  textarea.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      finalize(false);
+    }
+    if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      textarea.blur();
+    }
+  });
+}
+
+function buildTimeSlots() {
+  const slots = [];
+  for (let hour = 0; hour < 24; hour += 1) {
+    slots.push({ hour, minute: 0 });
+    slots.push({ hour, minute: 30 });
+  }
+  return slots;
+}
+
+function slotKeyFromDate(dateObj) {
+  const hour = dateObj.getHours();
+  const minute = dateObj.getMinutes() < 30 ? 0 : 30;
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+}
+
 function renderWeek(days, dayTasks) {
   weekGrid.innerHTML = '';
+  const slots = buildTimeSlots();
   days.forEach((day, idx) => {
     const card = document.createElement('div');
     card.className = 'day-card';
@@ -500,17 +614,56 @@ function renderWeek(days, dayTasks) {
     heading.textContent = DAY_FMT.format(day);
     card.appendChild(heading);
     const tasks = dayTasks[idx] || [];
+    const timeline = document.createElement('div');
+    timeline.className = 'day-timeline';
+    const buckets = new Map();
+    tasks.forEach((task) => {
+      registerTask(task);
+      if (!task.planned_start) {
+        return;
+      }
+      const start = new Date(task.planned_start);
+      const key = slotKeyFromDate(start);
+      const list = buckets.get(key) || [];
+      list.push(task);
+      buckets.set(key, list);
+    });
+
+    slots.forEach((slot) => {
+      const timeStr = formatTimeInput(slot.hour, slot.minute);
+      const row = document.createElement('div');
+      row.className = 'time-slot';
+      const label = document.createElement('div');
+      label.className = 'time-label';
+      label.textContent = timeStr;
+      const drop = document.createElement('div');
+      drop.className = 'time-drop';
+      drop.addEventListener('dragover', (event) => {
+        event.preventDefault();
+        drop.classList.add('drag-over');
+      });
+      drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
+      drop.addEventListener('drop', async (event) => {
+        drop.classList.remove('drag-over');
+        await handleDropOnSlot(event, dayStr, timeStr);
+      });
+      const slotTasks = buckets.get(timeStr) || [];
+      slotTasks.forEach((task) => {
+        drop.appendChild(renderTask(task, dayStr));
+      });
+      row.appendChild(label);
+      row.appendChild(drop);
+      timeline.appendChild(row);
+    });
+
     if (!tasks.length) {
       const empty = document.createElement('div');
       empty.className = 'backlog-meta';
       empty.textContent = 'Нет запланированных задач.';
-      card.appendChild(empty);
-    } else {
-      tasks.forEach((task) => {
-        registerTask(task);
-        card.appendChild(renderTask(task, dayStr));
-      });
+      timeline.appendChild(empty);
     }
+
+    card.appendChild(timeline);
     weekGrid.appendChild(card);
   });
 }
@@ -531,6 +684,11 @@ function renderBacklog(backlog) {
     item.addEventListener('dragstart', (event) => handleDragStart(event, task.id));
     const title = createTitleElement(task, item);
     item.appendChild(title);
+    const meta = document.createElement('div');
+    meta.className = 'task-meta';
+    meta.appendChild(createPriorityElement(task));
+    meta.appendChild(createNotesElement(task, item));
+    item.appendChild(meta);
     const metaParts = [];
     if (task.due_at) {
       const due = new Date(task.due_at);
@@ -686,8 +844,10 @@ async function handleMarkDone() {
     setStatus('Сначала выберите задачу.', true);
     return;
   }
-  await runAction('Отмечаю выполненной', async () => {
-    await patchTask(task.id, { is_done: true });
+  const nextDone = !task.is_done;
+  const label = nextDone ? 'Отмечаю выполненной' : 'Возвращаю в работу';
+  await runAction(label, async () => {
+    await patchTask(task.id, { is_done: nextDone });
   });
 }
 
@@ -796,3 +956,23 @@ backlogList.addEventListener('drop', async (event) => {
 });
 
 setActionButtonsEnabled(false);
+
+document.addEventListener('keydown', (event) => {
+  if (!selectedTaskId) return;
+  const target = event.target;
+  if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) {
+    return;
+  }
+  if (event.key === 'Delete' || event.key === 'Backspace') {
+    event.preventDefault();
+    handleDelete();
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    handleMarkDone();
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    clearSelection();
+  }
+});
