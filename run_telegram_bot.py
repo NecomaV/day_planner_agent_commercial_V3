@@ -30,6 +30,7 @@ from app.services.meal_suggest import suggest_meals
 from app.services.quick_capture import parse_quick_task
 from app.services.reminders import format_reminder_message
 from app.services.slots import (
+    Interval,
     build_busy_intervals,
     day_bounds,
     format_gap_options,
@@ -85,10 +86,15 @@ def _is_skip(text: str) -> bool:
 
 
 def _parse_yes_no(text: str) -> bool | None:
-    lower = text.strip().lower()
-    if lower in {"да", "ага", "конечно", "yes", "y", "ok", "ок"}:
+    cleaned = re.sub(r"[^\w\s]", " ", text.strip().lower())
+    tokens = {t for t in cleaned.split() if t}
+    yes_words = {"да", "ага", "угу", "конечно", "yes", "y", "ok", "ок", "sure"}
+    no_words = {"нет", "неа", "no", "n"}
+    has_yes = bool(tokens & yes_words)
+    has_no = bool(tokens & no_words)
+    if has_yes and not has_no:
         return True
-    if lower in {"нет", "неа", "no", "n"}:
+    if has_no and not has_yes:
         return False
     return None
 
@@ -121,6 +127,134 @@ def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return r * c
+
+
+MONTH_MAP = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
+
+MONTH_RE = re.compile(r"\b(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b", re.IGNORECASE)
+DATE_LIST_RE = re.compile(
+    r"((?:\d{1,2}(?:-?е|го)?\s*(?:,|и|или)?\s*)+)\s*(?:числа|число)?\s*(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)",
+    re.IGNORECASE,
+)
+DATE_RANGE_RE = re.compile(
+    r"\b(?:с|со)\s+(\d{1,2})(?:-?е|го)?\s+(?:по|до)\s+(\d{1,2})(?:-?е|го)?\s*(?:числа|число)?\s*(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)?",
+    re.IGNORECASE,
+)
+
+
+def _normalize_year(day: int, month: int, now: dt.datetime) -> int:
+    year = now.year
+    try:
+        candidate = dt.date(year, month, day)
+    except ValueError:
+        return year
+    if candidate < now.date():
+        return year + 1
+    return year
+
+
+def _extract_dates_from_text(text: str, now: dt.datetime) -> list[dt.date]:
+    dates: set[dt.date] = set()
+    for m in re.finditer(r"\b(\d{4}-\d{2}-\d{2})\b", text):
+        try:
+            dates.add(dt.date.fromisoformat(m.group(1)))
+        except ValueError:
+            continue
+
+    for match in DATE_RANGE_RE.finditer(text):
+        start_day = int(match.group(1))
+        end_day = int(match.group(2))
+        month_token = match.group(3)
+        month = MONTH_MAP.get(month_token.lower()) if month_token else now.month
+        if not month:
+            continue
+        start = min(start_day, end_day)
+        end = max(start_day, end_day)
+        for day in range(start, end + 1):
+            year = _normalize_year(day, month, now)
+            try:
+                dates.add(dt.date(year, month, day))
+            except ValueError:
+                continue
+
+    for match in DATE_LIST_RE.finditer(text):
+        days_raw = match.group(1)
+        month_token = match.group(2).lower()
+        month = MONTH_MAP.get(month_token)
+        if not month:
+            continue
+        for day_str in re.findall(r"\d{1,2}", days_raw):
+            day = int(day_str)
+            year = _normalize_year(day, month, now)
+            try:
+                dates.add(dt.date(year, month, day))
+            except ValueError:
+                continue
+
+    if not dates and re.search(r"\bчисл", text.lower()):
+        for day_str in re.findall(r"\b\d{1,2}\b", text):
+            day = int(day_str)
+            month = now.month
+            year = _normalize_year(day, month, now)
+            try:
+                dates.add(dt.date(year, month, day))
+            except ValueError:
+                continue
+
+    return sorted(dates)
+
+
+def _detect_relative_day(text: str, now: dt.datetime) -> dt.date | None:
+    lower = text.lower()
+    if "сегодня" in lower or "today" in lower:
+        return now.date()
+    if "послезавтра" in lower:
+        return now.date() + dt.timedelta(days=2)
+    if "завтра" in lower or "tomorrow" in lower:
+        return now.date() + dt.timedelta(days=1)
+    return None
+
+
+def _parse_duration_minutes(text: str) -> int | None:
+    lower = text.lower()
+    m = re.search(r"\b(\d{1,3})\s*(мин|минут|минуты|m)\b", lower)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"\b(\d{1,2})(?:[.,](\d))?\s*(час|часа|часов|h)\b", lower)
+    if m:
+        hours = int(m.group(1))
+        frac = int(m.group(2) or 0)
+        minutes = hours * 60 + (30 if frac >= 5 else 0)
+        return minutes
+    return None
+
+
+def _normalize_task_title(title: str) -> str:
+    cleaned = re.sub(r"\s+", " ", title).strip()
+    cleaned = re.sub(r"^(задача|задачи)\b[:\s]*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(пожалуйста|пж|плиз|пожалуй)\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.-")
+    return cleaned or title
+
+
+def _shorten_title(title: str, max_words: int = 6) -> str:
+    words = [w for w in title.split() if w]
+    if len(words) <= max_words:
+        return title
+    return " ".join(words[:max_words])
 
 
 def _extract_person_name(text: str) -> str | None:
@@ -223,6 +357,19 @@ def _looks_like_greeting(text: str) -> bool:
         "hello",
         "hey",
     }
+
+
+def _looks_like_delete_by_date(text: str, now: dt.datetime) -> bool:
+    lower = text.lower()
+    if not any(word in lower for word in ["удали", "удалить", "стереть", "убери", "delete", "clear"]):
+        return False
+    if _extract_dates_from_text(text, now):
+        return True
+    if _detect_relative_day(text, now):
+        return True
+    if MONTH_RE.search(text):
+        return True
+    return False
 
 
 def _parse_clear_targets(text: str) -> list[str]:
@@ -372,7 +519,7 @@ def _parse_weekday(value: str) -> int | None:
 def _parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
     lower = text.lower()
     range_match = re.search(
-        r"(?:с\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:-|–|—|до)\s*(\d{1,2})(?::(\d{2}))?",
+        r"(?:с\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:-|-|–|—|до|по)\s*(\d{1,2})(?::(\d{2}))?",
         lower,
     )
     if not range_match:
@@ -398,7 +545,11 @@ def _parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
 
 def _parse_time_value(text: str) -> dt.time | None:
     lower = text.lower()
-    range_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*[-–—]\s*(\d{1,2})(?::(\d{2}))?", lower)
+    if "полдень" in lower:
+        return dt.time(12, 0)
+    if "полночь" in lower:
+        return dt.time(0, 0)
+    range_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*[---]\s*(\d{1,2})(?::(\d{2}))?", lower)
     meridian_pm = bool(re.search(r"\b(pm|вечера|дня)\b", lower))
     meridian_am = bool(re.search(r"\b(am|утра|ночи)\b", lower))
 
@@ -426,14 +577,177 @@ def _parse_time_value(text: str) -> dt.time | None:
         return midpoint.time().replace(second=0, microsecond=0)
 
     m = re.search(r"(\d{1,2})(?::(\d{2}))?", lower)
-    if not m:
-        return None
-    hh = apply_meridian(int(m.group(1)))
-    mm = int(m.group(2) or 0)
-    if hh > 23 or mm > 59:
-        return None
-    return dt.time(hh, mm)
+    if m:
+        hh = apply_meridian(int(m.group(1)))
+        mm = int(m.group(2) or 0)
+        if hh > 23 or mm > 59:
+            return None
+        return dt.time(hh, mm)
 
+    word_map = {
+        "один": 1,
+        "два": 2,
+        "три": 3,
+        "четыре": 4,
+        "пять": 5,
+        "шесть": 6,
+        "семь": 7,
+        "восемь": 8,
+        "девять": 9,
+        "десять": 10,
+        "одиннадцать": 11,
+        "двенадцать": 12,
+        "тринадцать": 13,
+        "четырнадцать": 14,
+        "пятнадцать": 15,
+        "шестнадцать": 16,
+        "семнадцать": 17,
+        "восемнадцать": 18,
+        "девятнадцать": 19,
+        "двадцать": 20,
+        "полдня": 12,
+    }
+    for word, hour in word_map.items():
+        if re.search(rf"\b{word}\b", lower):
+            hh = apply_meridian(hour)
+            if hh > 23:
+                return None
+            return dt.time(hh, 0)
+    return None
+
+
+def _has_due_intent(text: str) -> bool:
+    return bool(re.search(r"\b(до|дедлайн|deadline|срок)\b", text.lower()))
+
+
+def _resolve_date_for_time(now: dt.datetime, date: dt.date | None, time_value: dt.time) -> dt.datetime:
+    base_date = date or now.date()
+    candidate = dt.datetime.combine(base_date, time_value)
+    if date is None and candidate < now:
+        candidate = candidate + dt.timedelta(days=1)
+    return candidate
+
+
+def _format_date_list(dates: list[dt.date]) -> str:
+    return ", ".join(sorted({d.isoformat() for d in dates}))
+
+
+def _extract_task_timing(text: str, now: dt.datetime) -> tuple[dt.date | None, tuple[dt.time, dt.time] | None, dt.time | None, int | None]:
+    dates = _extract_dates_from_text(text, now)
+    date = dates[0] if dates else _detect_relative_day(text, now)
+    time_range = _parse_time_range(text)
+    time_value = _parse_time_value(text)
+    duration = _parse_duration_minutes(text)
+    if not date and time_range:
+        start = dt.datetime.combine(now.date(), time_range[0])
+        date = start.date() if start >= now else (now.date() + dt.timedelta(days=1))
+    if not date and time_value:
+        date = _resolve_date_for_time(now, None, time_value).date()
+    return date, time_range, time_value, duration
+
+
+def _find_conflicts(db, user_id: int, start: dt.datetime, end: dt.datetime) -> list:
+    day = start.date()
+    tasks = crud.list_tasks_for_day(db, user_id, day)
+    conflicts = []
+    for task in tasks:
+        if not task.planned_start or not task.planned_end:
+            continue
+        if task.is_done:
+            continue
+        if task.planned_start < end and task.planned_end > start:
+            conflicts.append(task)
+    return conflicts
+
+
+def _format_conflict_prompt(conflicts: list) -> str:
+    lines = ["Похоже, на это время уже есть задачи:"]
+    for task in conflicts[:3]:
+        lines.append(f"- {task.planned_start.strftime('%H:%M')}-{task.planned_end.strftime('%H:%M')} {task.title}")
+    lines.append("Что сделать? 1) заменить, 2) перенести это, 3) вставить со сдвигом")
+    return "\n".join(lines)
+
+
+def _parse_conflict_choice(text: str) -> str | None:
+    lower = text.strip().lower()
+    if re.search(r"\b1\b", lower) or "замен" in lower or "replace" in lower:
+        return "replace"
+    if re.search(r"\b2\b", lower) or "перен" in lower or "move" in lower:
+        return "move"
+    if re.search(r"\b3\b", lower) or "сдвиг" in lower or "встав" in lower or "shift" in lower or "insert" in lower:
+        return "shift"
+    if any(word in lower for word in ["отмена", "cancel", "нет", "не надо", "не нужно", "стоп", "stop"]):
+        return "cancel"
+    return None
+
+
+def _find_next_gap_after(
+    db,
+    user_id: int,
+    day: dt.date,
+    routine,
+    duration: dt.timedelta,
+    after: dt.datetime,
+) -> tuple[dt.datetime, dt.datetime] | None:
+    gaps, day_start, _ = _gaps_for_day(db, user_id, day, routine)
+    cursor = max(after, day_start)
+    for gap in gaps:
+        if gap.end <= cursor:
+            continue
+        start = max(gap.start, cursor)
+        if start + duration <= gap.end:
+            return start, start + duration
+    return None
+
+
+def _plan_shifted_tasks(
+    db,
+    user_id: int,
+    day: dt.date,
+    routine,
+    start: dt.datetime,
+    end: dt.datetime,
+) -> tuple[list[tuple[object, dt.datetime, dt.datetime]], str | None]:
+    tasks = crud.list_tasks_for_day(db, user_id, day)
+    scheduled = [t for t in tasks if t.planned_start and t.planned_end and not t.is_done]
+    fixed = [t for t in scheduled if t.task_type != "user" or t.planned_end <= start]
+    blockers = [t for t in fixed if t.planned_start < end and t.planned_end > start]
+    if blockers:
+        return [], "blocked"
+
+    movable = [t for t in scheduled if t.task_type == "user" and t.planned_end > start]
+    movable.sort(key=lambda t: t.planned_start)
+
+    now = _now_local_naive()
+    day_start, day_end, _morn_s, _morn_e = day_bounds(day, routine, now=now)
+    busy = build_busy_intervals(fixed, routine)
+    busy.append(Interval(start, end))
+    buffer_after = dt.timedelta(minutes=int(getattr(routine, "task_buffer_after_min", 0) or 0))
+
+    moved: list[tuple[object, dt.datetime, dt.datetime]] = []
+    cursor = end
+    for task in movable:
+        duration = task.planned_end - task.planned_start
+        gaps = gaps_from_busy(busy, day_start, day_end)
+        slot = None
+        for gap in gaps:
+            if gap.end <= cursor:
+                continue
+            candidate = max(gap.start, cursor, task.planned_start)
+            if candidate + duration <= gap.end:
+                slot = (candidate, candidate + duration)
+                break
+        if not slot:
+            return [], "no_space"
+        new_start, new_end = slot
+        moved.append((task, new_start, new_end))
+        busy.append(Interval(new_start, new_end + buffer_after))
+        cursor = new_end + buffer_after
+
+    if moved and cursor > day_end:
+        return [], "no_space"
+
+    return moved, None
 
 async def _get_user(update: Update, db):
     chat_id = update.effective_chat.id
@@ -1158,6 +1472,201 @@ async def _handle_pending_schedule(
     return True
 
 
+async def _prompt_conflict_resolution(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    conflicts: list,
+    *,
+    title: str,
+    start: dt.datetime,
+    end: dt.datetime,
+    estimate: int,
+    idempotency_key: str | None = None,
+) -> None:
+    await update.message.reply_text(_format_conflict_prompt(conflicts))
+    context.user_data["pending_conflict"] = {
+        "title": title,
+        "start": start,
+        "end": end,
+        "estimate": estimate,
+        "idempotency_key": idempotency_key,
+    }
+
+
+async def _handle_pending_conflict(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+    routine,
+) -> bool:
+    pending = context.user_data.get("pending_conflict")
+    if not pending:
+        return False
+
+    now = _now_local_naive()
+    choice = _parse_conflict_choice(text)
+    date_hint, time_range, time_value, duration_hint = _extract_task_timing(text, now)
+    if choice is None and (date_hint or time_range or time_value):
+        choice = "move"
+
+    if choice is None:
+        await update.message.reply_text("Выберите: 1) заменить, 2) перенести, 3) вставить со сдвигом.")
+        return True
+
+    if choice == "cancel":
+        context.user_data.pop("pending_conflict", None)
+        await update.message.reply_text("Окей, ничего не делаю.")
+        return True
+
+    start = pending.get("start")
+    end = pending.get("end")
+    title = pending.get("title") or "Задача"
+    estimate = int(pending.get("estimate") or 30)
+    idempotency_key = pending.get("idempotency_key")
+    if not start or not end:
+        context.user_data.pop("pending_conflict", None)
+        await update.message.reply_text("Не нашел исходное время задачи, попробуйте еще раз.")
+        return True
+
+    day = start.date()
+    if choice == "replace":
+        conflicts = _find_conflicts(db, user.id, start, end)
+        blocked = [t for t in conflicts if t.task_type != "user"]
+        if blocked:
+            await update.message.reply_text(
+                "В это время есть системные блоки или рутина, заменить нельзя. Выберите перенос или сдвиг."
+            )
+            return True
+        deleted = []
+        for task in conflicts:
+            if task.task_type == "user":
+                crud.delete_task(db, user.id, task.id)
+                deleted.append(task.id)
+        payload = TaskCreate(
+            title=title,
+            notes=None,
+            estimate_minutes=estimate,
+            planned_start=start,
+            planned_end=end,
+            due_at=None,
+            priority=2,
+            kind=None,
+            idempotency_key=idempotency_key,
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        context.user_data.pop("pending_conflict", None)
+        deleted_text = f"Заменил: {', '.join(str(i) for i in deleted)}. " if deleted else ""
+        await update.message.reply_text(
+            f"{deleted_text}Запланировано (id={task.id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()})"
+        )
+        return True
+
+    if choice == "move":
+        if time_range:
+            base_date = date_hint or day
+            new_start = dt.datetime.combine(base_date, time_range[0])
+            new_end = dt.datetime.combine(base_date, time_range[1])
+            duration_minutes = max(1, int((new_end - new_start).total_seconds() // 60))
+        elif time_value:
+            base_date = date_hint or day
+            duration_minutes = int(duration_hint or estimate)
+            new_start = dt.datetime.combine(base_date, time_value)
+            new_end = new_start + dt.timedelta(minutes=duration_minutes)
+        else:
+            base_date = date_hint or day
+            duration_td = dt.timedelta(minutes=estimate)
+            new_start = new_end = None
+            for offset in range(0, 3):
+                candidate_day = base_date + dt.timedelta(days=offset)
+                after = start if candidate_day == day and offset == 0 else dt.datetime.combine(candidate_day, dt.time.min)
+                slot = _find_next_gap_after(db, user.id, candidate_day, routine, duration_td, after)
+                if slot:
+                    new_start, new_end = slot
+                    break
+            if not new_start or not new_end:
+                await update.message.reply_text("Не нашел свободного слота, выберите другое время.")
+                return True
+            duration_minutes = estimate
+
+        if new_end <= new_start:
+            await update.message.reply_text("Проверьте время: конец должен быть позже начала.")
+            return True
+
+        conflicts = _find_conflicts(db, user.id, new_start, new_end)
+        if conflicts:
+            context.user_data["pending_conflict"] = {
+                "title": title,
+                "start": new_start,
+                "end": new_end,
+                "estimate": duration_minutes,
+                "idempotency_key": idempotency_key,
+            }
+            await update.message.reply_text(_format_conflict_prompt(conflicts))
+            return True
+
+        payload = TaskCreate(
+            title=title,
+            notes=None,
+            estimate_minutes=duration_minutes,
+            planned_start=new_start,
+            planned_end=new_end,
+            due_at=None,
+            priority=2,
+            kind=None,
+            idempotency_key=idempotency_key,
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        context.user_data.pop("pending_conflict", None)
+        await update.message.reply_text(
+            f"Запланировано (id={task.id}) {new_start.strftime('%H:%M')}-{new_end.strftime('%H:%M')} ({new_start.date().isoformat()})"
+        )
+        return True
+
+    if choice == "shift":
+        moved, err = _plan_shifted_tasks(db, user.id, day, routine, start, end)
+        if err == "blocked":
+            await update.message.reply_text(
+                "В это время есть системные блоки или рутина, сдвиг невозможен. Выберите перенос."
+            )
+            return True
+        if err == "no_space":
+            await update.message.reply_text("Не хватает места в этом дне для сдвига. Выберите перенос.")
+            return True
+
+        for task, new_start, new_end in moved:
+            crud.update_task_fields(
+                db,
+                user.id,
+                task.id,
+                planned_start=new_start,
+                planned_end=new_end,
+                schedule_source="assistant",
+            )
+
+        payload = TaskCreate(
+            title=title,
+            notes=None,
+            estimate_minutes=estimate,
+            planned_start=start,
+            planned_end=end,
+            due_at=None,
+            priority=2,
+            kind=None,
+            idempotency_key=idempotency_key,
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        context.user_data.pop("pending_conflict", None)
+        await update.message.reply_text(
+            f"Запланировано (id={task.id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({day.isoformat()}). "
+            f"Сдвинул задач: {len(moved)}."
+        )
+        return True
+
+    return True
+
+
 async def _handle_pending_task(
     text: str,
     update: Update,
@@ -1169,18 +1678,93 @@ async def _handle_pending_task(
     pending = context.user_data.get("pending_task")
     if not pending:
         return False
-    if pending.get("step") != "due":
+    step = pending.get("step")
+    if step == "time":
+        if _is_no_due(text):
+            payload = TaskCreate(
+                title=pending.get("title") or "Задача",
+                notes=None,
+                estimate_minutes=int(pending.get("estimate") or 30),
+                planned_start=None,
+                planned_end=None,
+                due_at=None,
+                priority=2,
+                kind=None,
+                idempotency_key=None,
+            )
+            task = crud.create_task(db, user_id=user.id, data=payload)
+            context.user_data.pop("pending_task", None)
+            await update.message.reply_text(f"Добавлено в бэклог (id={task.id}).")
+            return True
+
+        time_value = _parse_time_value(text)
+        if not time_value:
+            await update.message.reply_text("Не понял время. Пример: 12:30 или 9 утра.")
+            return True
+
+        date = pending.get("date")
+        if not isinstance(date, dt.date):
+            await update.message.reply_text("Не удалось определить дату задачи.")
+            context.user_data.pop("pending_task", None)
+            return True
+
+        start = dt.datetime.combine(date, time_value)
+        duration = int(pending.get("estimate") or 30)
+        end = start + dt.timedelta(minutes=duration)
+        conflicts = _find_conflicts(db, user.id, start, end)
+        if conflicts:
+            await _prompt_conflict_resolution(
+                update,
+                context,
+                conflicts,
+                title=pending.get("title") or "??????",
+                start=start,
+                end=end,
+                estimate=duration,
+            )
+            context.user_data.pop("pending_task", None)
+            return True
+
+        payload = TaskCreate(
+            title=pending.get("title") or "Задача",
+            notes=None,
+            estimate_minutes=duration,
+            planned_start=start,
+            planned_end=end,
+            due_at=None,
+            priority=2,
+            kind=None,
+            idempotency_key=None,
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        context.user_data.pop("pending_task", None)
+        await update.message.reply_text(
+            f"Запланировано (id={task.id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({date.isoformat()})"
+        )
+        return True
+
+    if step != "due":
         return False
 
+    now = _now_local_naive()
     if _is_no_due(text):
         due_at = None
     else:
-        parsed = parse_quick_task(text, _now_local_naive())
+        parsed = parse_quick_task(text, now)
         due_at = parsed.due_at
         if parsed.title and parsed.title != text:
             pending["title"] = pending.get("title") or parsed.title
+        if due_at is None:
+            date, time_range, time_value, _ = _extract_task_timing(text, now)
+            if date and time_range:
+                due_at = dt.datetime.combine(date, time_range[1])
+            elif date and time_value:
+                due_at = dt.datetime.combine(date, time_value)
+            elif date:
+                due_at = dt.datetime.combine(date, dt.time(18, 0))
+
     if not _is_no_due(text) and due_at is None:
-        await update.message.reply_text("Не понял дедлайн. Пример: завтра в 15:00 или «без срока».")
+        await update.message.reply_text("Не понял дедлайн. Пример: завтра в 15:00 или <без срока>.")
         return True
 
     payload = TaskCreate(
@@ -1200,6 +1784,140 @@ async def _handle_pending_task(
     await _offer_schedule(task, update, context, db, user, routine)
     return True
 
+
+
+async def _handle_task_request(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+    routine,
+    *,
+    schedule_source: str = "assistant",
+    idempotency_key: str | None = None,
+) -> bool:
+    now = _now_local_naive()
+    parsed = parse_quick_task(text, now)
+    title = parsed.title.strip() if parsed.title else text.strip()
+    title = _normalize_task_title(title)
+    title = _shorten_title(title)
+    date, time_range, time_value, duration = _extract_task_timing(text, now)
+    estimate = duration or 30
+
+    if date and time_range:
+        start = dt.datetime.combine(date, time_range[0])
+        end = dt.datetime.combine(date, time_range[1])
+        conflicts = _find_conflicts(db, user.id, start, end)
+        if conflicts:
+            await _prompt_conflict_resolution(
+                update,
+                context,
+                conflicts,
+                title=title,
+                start=start,
+                end=end,
+                estimate=estimate,
+                idempotency_key=idempotency_key,
+            )
+            return True
+
+        payload = TaskCreate(
+            title=title,
+            notes=None,
+            estimate_minutes=estimate,
+            planned_start=start,
+            planned_end=end,
+            due_at=None,
+            priority=2,
+            kind=None,
+            idempotency_key=idempotency_key,
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        await update.message.reply_text(
+            f"Запланировано (id={task.id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({date.isoformat()})"
+        )
+        return True
+
+    if time_value:
+        start = _resolve_date_for_time(now, date, time_value)
+        end = start + dt.timedelta(minutes=estimate)
+        conflicts = _find_conflicts(db, user.id, start, end)
+        if conflicts:
+            await _prompt_conflict_resolution(
+                update,
+                context,
+                conflicts,
+                title=title,
+                start=start,
+                end=end,
+                estimate=estimate,
+                idempotency_key=idempotency_key,
+            )
+            return True
+
+        payload = TaskCreate(
+            title=title,
+            notes=None,
+            estimate_minutes=estimate,
+            planned_start=start,
+            planned_end=end,
+            due_at=None,
+            priority=2,
+            kind=None,
+            idempotency_key=idempotency_key,
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        await update.message.reply_text(
+            f"Запланировано (id={task.id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')} ({start.date().isoformat()})"
+        )
+        return True
+
+    if date and not _has_due_intent(text):
+        context.user_data["pending_task"] = {
+            "step": "time",
+            "title": title,
+            "date": date,
+            "estimate": estimate,
+        }
+        await update.message.reply_text("Во сколько поставить задачу?")
+        return True
+
+    if date and _has_due_intent(text):
+        due_at = dt.datetime.combine(date, dt.time(18, 0))
+        payload = TaskCreate(
+            title=title,
+            notes=None,
+            estimate_minutes=estimate,
+            planned_start=None,
+            planned_end=None,
+            due_at=due_at,
+            priority=2,
+            kind=None,
+            idempotency_key=idempotency_key,
+        )
+        task = crud.create_task(db, user_id=user.id, data=payload)
+        await update.message.reply_text(f"Добавлено: {task.title}. Срок: {due_at.strftime('%Y-%m-%d %H:%M')}.")
+        await _offer_schedule(task, update, context, db, user, routine)
+        return True
+
+    payload = TaskCreate(
+        title=title,
+        notes=None,
+        estimate_minutes=estimate,
+        planned_start=None,
+        planned_end=None,
+        due_at=None,
+        priority=2,
+        kind=None,
+        idempotency_key=idempotency_key,
+    )
+    task = crud.create_task(db, user_id=user.id, data=payload)
+    if parsed.checklist_items:
+        crud.add_checklist_items(db, task.id, parsed.checklist_items)
+    await update.message.reply_text(f"Добавлено в бэклог: {task.title} (id={task.id}).")
+    return True
+
 async def _process_user_text(
     text: str,
     update: Update,
@@ -1209,6 +1927,9 @@ async def _process_user_text(
 ) -> None:
     routine = crud.get_routine(db, user.id)
     ai_enabled = bool(settings.OPENAI_API_KEY)
+
+    if await _handle_pending_conflict(text, update, context, db, user, routine):
+        return
 
     if await _handle_pending_schedule(text, update, context, db, user):
         return
@@ -1242,6 +1963,21 @@ async def _process_user_text(
 
     if _looks_like_greeting(text):
         await update.message.reply_text("Привет! Чем помочь?")
+        return
+
+    if _looks_like_delete_by_date(text, _now_local_naive()):
+        now = _now_local_naive()
+        dates = _extract_dates_from_text(text, now)
+        if not dates:
+            relative = _detect_relative_day(text, now)
+            if relative:
+                dates = [relative]
+        if not dates:
+            await update.message.reply_text("Не понял даты. Пример: удали задачи 30 и 31 декабря.")
+            return
+        count = crud.delete_tasks_by_dates(db, user.id, dates)
+        dates_text = _format_date_list(dates)
+        await update.message.reply_text(f"Удалено задач на даты: {dates_text}. Всего: {count}.")
         return
 
     if _looks_like_clear_all(text):
@@ -1367,35 +2103,16 @@ async def _process_user_text(
             return
         await update.message.reply_text("Если нужно создать задачу, скажите: «создай задачу ...»")
         return
-
-    parsed = parse_quick_task(text, _now_local_naive())
-    if parsed.due_at is None:
-        context.user_data["pending_task"] = {
-            "step": "due",
-            "title": parsed.title,
-            "estimate": 30,
-        }
-        await update.message.reply_text("Когда дедлайн? Можно ответить «без срока».")
-        return
-    payload = TaskCreate(
-        title=parsed.title,
-        notes=None,
-        estimate_minutes=30,
-        planned_start=None,
-        planned_end=None,
-        due_at=parsed.due_at,
-        priority=2,
-        kind=None,
+    await _handle_task_request(
+        text,
+        update,
+        context,
+        db,
+        user,
+        routine,
+        schedule_source="manual",
         idempotency_key=_idempotency_key(update),
     )
-    task = crud.create_task(db, user_id=user.id, data=payload)
-    if parsed.checklist_items:
-        crud.add_checklist_items(db, task.id, parsed.checklist_items)
-
-    when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(без срока)"
-    checklist_info = f" Чек-лист: {len(parsed.checklist_items)} пунктов." if parsed.checklist_items else ""
-    await update.message.reply_text(f"Добавлено: {task.title}. Срок: {when}.{checklist_info}")
-    await _offer_schedule(task, update, context, db, user, routine)
 
 
 async def _handle_ai_intent(
@@ -1534,38 +2251,18 @@ async def _handle_ai_intent(
         return await _run_command_by_name(name, [str(a) for a in args], update, context)
 
     if intent == "task":
-        text = data.get("text") or original_text
-        if not _should_create_task(original_text):
-            return False
-        parsed = parse_quick_task(text, _now_local_naive())
-        if parsed.due_at is None:
-            context.user_data["pending_task"] = {
-                "step": "due",
-                "title": parsed.title,
-                "estimate": 30,
-            }
-            await update.message.reply_text("Когда дедлайн? Можно ответить «без срока».")
-            return True
-        payload = TaskCreate(
-            title=parsed.title,
-            notes=None,
-            estimate_minutes=30,
-            planned_start=None,
-            planned_end=None,
-            due_at=parsed.due_at,
-            priority=2,
-            kind=None,
+        task_text = data.get("text") or original_text
+        routine = crud.get_routine(db, user.id)
+        return await _handle_task_request(
+            task_text,
+            update,
+            context,
+            db,
+            user,
+            routine,
+            schedule_source="assistant",
             idempotency_key=_idempotency_key(update),
         )
-        task = crud.create_task(db, user_id=user.id, data=payload)
-        if parsed.checklist_items:
-            crud.add_checklist_items(db, task.id, parsed.checklist_items)
-        when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(без срока)"
-        checklist_info = f" Чек-лист: {len(parsed.checklist_items)} пунктов." if parsed.checklist_items else ""
-        await update.message.reply_text(f"Добавлено: {task.title}. Срок: {when}.{checklist_info}")
-        routine = crud.get_routine(db, user.id)
-        await _offer_schedule(task, update, context, db, user, routine)
-        return True
 
     return False
 

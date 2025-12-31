@@ -314,6 +314,36 @@ def delete_all_tasks(db: Session, user_id: int) -> int:
     return len(tasks)
 
 
+def delete_tasks_by_dates(db: Session, user_id: int, dates: list[dt.date]) -> int:
+    if not dates:
+        return 0
+    date_set = set(dates)
+    tasks = list(
+        db.execute(
+            select(Task).where(
+                and_(
+                    Task.user_id == user_id,
+                    Task.task_type == "user",
+                )
+            )
+        ).scalars()
+    )
+    to_delete = []
+    for task in tasks:
+        task_date = None
+        if task.planned_start:
+            task_date = task.planned_start.date()
+        elif task.due_at:
+            task_date = task.due_at.date()
+        if task_date and task_date in date_set:
+            to_delete.append(task)
+    for task in to_delete:
+        db.delete(task)
+    if to_delete:
+        db.commit()
+    return len(to_delete)
+
+
 def get_task(db: Session, user_id: int, task_id: int) -> Task | None:
     return db.execute(select(Task).where(and_(Task.id == task_id, Task.user_id == user_id))).scalar_one_or_none()
 

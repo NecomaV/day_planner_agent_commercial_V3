@@ -1,16 +1,24 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import datetime as dt
 import re
 from dataclasses import dataclass
 
-
 DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+DAY_MONTH_RE = re.compile(
+    r"\b(\d{1,2})\s*(?:-?е|го)?\s*(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b",
+    re.IGNORECASE,
+)
 TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\b", re.IGNORECASE)
-CHECKLIST_RE = re.compile(r"\b(checklist|steps|чек\\s*-?лист|список|шаги|подзадачи):\s*(.+)$", re.IGNORECASE)
-NEXT_WEEKDAY_RE = re.compile(r"\bnext\s+(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b", re.IGNORECASE)
-RUS_WEEKDAY_RE = re.compile(r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b", re.IGNORECASE)
-
+CHECKLIST_RE = re.compile(r"\b(checklist|steps|чек[- ]?лист|чеклист|список|пункты):\s*(.+)$", re.IGNORECASE)
+NEXT_WEEKDAY_RE = re.compile(
+    r"\bnext\s+(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
+RUS_WEEKDAY_RE = re.compile(
+    r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b",
+    re.IGNORECASE,
+)
 
 WEEKDAY_MAP = {
     "mon": 0,
@@ -48,6 +56,21 @@ RUS_WEEKDAY_MAP = {
     "воскресенье": 6,
 }
 
+MONTH_MAP = {
+    "января": 1,
+    "февраля": 2,
+    "марта": 3,
+    "апреля": 4,
+    "мая": 5,
+    "июня": 6,
+    "июля": 7,
+    "августа": 8,
+    "сентября": 9,
+    "октября": 10,
+    "ноября": 11,
+    "декабря": 12,
+}
+
 
 @dataclass(frozen=True)
 class QuickCaptureResult:
@@ -56,11 +79,34 @@ class QuickCaptureResult:
     checklist_items: list[str]
 
 
+def _normalize_year(day: int, month: int, now: dt.datetime) -> int:
+    year = now.year
+    try:
+        candidate = dt.date(year, month, day)
+    except ValueError:
+        return year
+    if candidate < now.date():
+        return year + 1
+    return year
+
+
 def _parse_date(text: str, now: dt.datetime) -> dt.date | None:
     m = DATE_RE.search(text)
     if m:
         try:
             return dt.date.fromisoformat(m.group(1))
+        except ValueError:
+            return None
+
+    m = DAY_MONTH_RE.search(text)
+    if m:
+        day = int(m.group(1))
+        month = MONTH_MAP.get(m.group(2).lower())
+        if not month:
+            return None
+        year = _normalize_year(day, month, now)
+        try:
+            return dt.date(year, month, day)
         except ValueError:
             return None
 
@@ -126,6 +172,7 @@ def parse_quick_task(text: str, now: dt.datetime) -> QuickCaptureResult:
 
     date = _parse_date(cleaned, now)
     time_text = DATE_RE.sub("", cleaned)
+    time_text = DAY_MONTH_RE.sub("", time_text)
     time = _parse_time(time_text)
 
     due_at = None
@@ -139,13 +186,14 @@ def parse_quick_task(text: str, now: dt.datetime) -> QuickCaptureResult:
 
     stripped = cleaned
     stripped = DATE_RE.sub("", stripped)
+    stripped = DAY_MONTH_RE.sub("", stripped)
     stripped = NEXT_WEEKDAY_RE.sub("", stripped)
     stripped = RUS_WEEKDAY_RE.sub("", stripped)
     stripped = re.sub(r"\b(today|tomorrow|сегодня|завтра|послезавтра)\b", "", stripped, flags=re.IGNORECASE)
     stripped = TIME_RE.sub("", stripped)
-    stripped = re.sub(r"\b(at|by|в|до|на)\b", "", stripped, flags=re.IGNORECASE)
+    stripped = re.sub(r"\b(at|by|в|на|до)\b", "", stripped, flags=re.IGNORECASE)
     stripped = re.sub(
-        r"\b(please|remind me to|i need to|i need|need to|need|add|пожалуйста|напомни|напомните|мне нужно|нужно|надо|поставь|добавь|сделать|задача)\b",
+        r"\b(please|remind me to|i need to|i need|need to|need|add|добавь|добавить|напомни|напомнить|нужно|надо|сделать|задача|задачи)\b",
         "",
         stripped,
         flags=re.IGNORECASE,
