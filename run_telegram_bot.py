@@ -286,14 +286,13 @@ def _build_assistant_context(db, user) -> str:
 
 def _assistant_system_prompt() -> str:
     return (
-        "Ты — русскоязычный ИИ‑ассистент для бизнеса (в стиле Джарвис), "
+        "Ты - русскоязычный ИИ-ассистент для бизнеса (в стиле Джарвис), "
         "помогаешь планировать день, отвечаешь на вопросы, предлагаешь идеи и уточнения. "
         "Будь кратким, дружелюбным и практичным. "
         "Если для ответа нужна дополнительная информация, задай уточняющий вопрос. "
-        "Не создавай задачи сам — предложи пользователю сказать: «создай задачу ...», "
+        "Не создавай задачи сам - предложи пользователю сказать: <создай задачу ...>, "
         "если это уместно."
     )
-
 
 def _parse_weekday(value: str) -> int | None:
     value = value.strip().lower()
@@ -1685,15 +1684,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
         user = await _get_user(update, db)
-        api_key_hint = " (нужен X-API-Key)" if settings.API_KEY else ""
+        api_key_hint = " + X-API-Key" if settings.API_KEY else ""
+        tz = user.timezone or settings.TZ
         await update.message.reply_text(
-            "Информация о пользователе:\n"
+            "Ваши данные для кабинета:\n"
             f"- user_id: {user.id}\n"
             f"- telegram_chat_id: {user.telegram_chat_id}\n"
-            f"- часовой пояс: {settings.TZ}\n\n"
-            f"Заголовок API: X-User-Id = user_id{api_key_hint}"
+            f"- часовой пояс: {tz}\n\n"
+            "Кабинет: http://127.0.0.1:8000/web\n"
+            f"API заголовок: X-User-Id = user_id{api_key_hint}"
         )
-
 
 async def cmd_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
@@ -1701,16 +1701,21 @@ async def cmd_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         steps = crud.list_routine_steps(db, user.id, active_only=False)
         pantry = crud.list_pantry_items(db, user.id)
         workouts = crud.list_workout_plans(db, user.id)
-        status = "активен" if user.is_active else "неактивен"
+        status = "активен" if user.is_active else "выключен"
         onboarded = "да" if user.onboarded else "нет"
         routine = crud.get_routine(db, user.id)
+        api_key_hint = " + X-API-Key" if settings.API_KEY else ""
+        tz = user.timezone or settings.TZ
         await update.message.reply_text(
-            "Кабинет:\n"
+            "Кабинет: http://127.0.0.1:8000/web\n"
+            f"API заголовок: X-User-Id = user_id{api_key_hint}\n\n"
+            "Профиль:\n"
+            f"- id: {user.id}\n"
             f"- имя: {user.full_name or 'не задано'}\n"
             f"- фокус: {user.primary_focus or 'не задан'}\n"
-            f"- часовой пояс: {user.timezone}\n"
+            f"- часовой пояс: {tz}\n"
             f"- рабочий день: {routine.workday_start}-{routine.workday_end}\n"
-            f"- до какого времени задачи: {routine.latest_task_end or 'не задано'}\n"
+            f"- ограничение по времени: {routine.latest_task_end or 'нет'}\n"
             f"- буфер между задачами: {routine.task_buffer_after_min} мин\n"
             f"- статус: {status}\n"
             f"- онбординг: {onboarded}\n"
@@ -1718,7 +1723,6 @@ async def cmd_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"- продуктов в кладовой: {len(pantry)}\n"
             f"- планов тренировок: {len(workouts)}"
         )
-
 
 async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     with get_db_session() as db:
