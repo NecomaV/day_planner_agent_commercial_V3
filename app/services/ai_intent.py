@@ -11,6 +11,7 @@ ALLOWED_INTENTS = {
     "workout_set",
     "breakfast",
     "plan",
+    "clear_all",
     "command",
     "unknown",
 }
@@ -34,12 +35,13 @@ def parse_intent(text: str, api_key: str | None, model: str) -> Optional[dict[st
     system = (
         "Return a JSON object that classifies the user's message. "
         "Supported languages: Russian, Ukrainian, English. "
-        "Allowed intents: task, routine, pantry_add, pantry_remove, workout_set, breakfast, plan, command, unknown. "
+        "Allowed intents: task, routine, pantry_add, pantry_remove, workout_set, breakfast, plan, clear_all, command, unknown. "
         "If intent=task, return {intent, text}. "
         "If intent=routine, return {intent, items:[...]} with routine step titles. "
         "If intent=pantry_add or pantry_remove, return {intent, items:[{name, quantity}]}. "
         "If intent=workout_set, return {intent, weekday, title, details}. "
         "If intent=breakfast or plan, return {intent}. "
+        "If intent=clear_all, return {intent, targets:[tasks, routine]}. "
         "If intent=command, return {intent, name, args} where name is one of: "
         "plan, autoplan, morning, routine_add, routine_list, routine_del, pantry, breakfast, workout, "
         "cabinet, login, logout, done, delete, unschedule, slots, place, schedule, todo, capture, call, "

@@ -15,6 +15,8 @@ class Settings(BaseSettings):
 
     # App
     TZ: str = "Asia/Almaty"
+    APP_HOST: str = "127.0.0.1"
+    APP_PORT: int = 8000
 
     # API
     API_KEY: str | None = None

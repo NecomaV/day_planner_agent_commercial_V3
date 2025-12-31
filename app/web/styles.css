@@ -1,12 +1,39 @@
 :root {
   --bg: #0f172a;
+  --bg-2: #020617;
   --panel: #111827;
   --panel-soft: #1f2937;
   --text: #f8fafc;
   --muted: #94a3b8;
   --accent: #f97316;
   --accent-2: #22d3ee;
+  --danger: #ef4444;
   --border: rgba(148, 163, 184, 0.2);
+  --shadow: rgba(2, 6, 23, 0.5);
+  --hero-start: rgba(15, 23, 42, 0.9);
+  --hero-end: rgba(31, 41, 55, 0.9);
+  --surface-1: rgba(15, 23, 42, 0.85);
+  --surface-2: rgba(31, 41, 55, 0.8);
+  --surface-3: rgba(2, 6, 23, 0.6);
+}
+
+:root[data-theme="light"] {
+  --bg: #f4f1ea;
+  --bg-2: #efe7dc;
+  --panel: #fff7ed;
+  --panel-soft: #f1e7d9;
+  --text: #1f2937;
+  --muted: #6b7280;
+  --accent: #f97316;
+  --accent-2: #0ea5e9;
+  --danger: #dc2626;
+  --border: rgba(148, 163, 184, 0.35);
+  --shadow: rgba(148, 163, 184, 0.3);
+  --hero-start: rgba(255, 247, 237, 0.95);
+  --hero-end: rgba(241, 231, 217, 0.95);
+  --surface-1: rgba(255, 247, 237, 0.9);
+  --surface-2: rgba(241, 231, 217, 0.85);
+  --surface-3: rgba(255, 255, 255, 0.8);
 }
 
 * {
@@ -16,7 +43,7 @@
 body {
   margin: 0;
   font-family: "Space Grotesk", sans-serif;
-  background: radial-gradient(circle at top, #0f172a 0%, #020617 60%);
+  background: radial-gradient(circle at top, var(--bg) 0%, var(--bg-2) 60%);
   color: var(--text);
 }
 
@@ -32,9 +59,10 @@ body {
   gap: 24px;
   align-items: center;
   padding: 24px;
-  background: linear-gradient(120deg, rgba(15, 23, 42, 0.9), rgba(31, 41, 55, 0.9));
+  background: linear-gradient(120deg, var(--hero-start), var(--hero-end));
   border: 1px solid var(--border);
   border-radius: 16px;
+  box-shadow: 0 12px 30px -24px var(--shadow);
 }
 
 .eyebrow {
@@ -58,7 +86,7 @@ h1 {
 .auth {
   display: grid;
   gap: 12px;
-  background: rgba(2, 6, 23, 0.6);
+  background: var(--surface-3);
   padding: 16px;
   border-radius: 12px;
   border: 1px solid var(--border);
@@ -86,12 +114,23 @@ label {
   color: var(--muted);
 }
 
-input {
+input,
+select {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 8px;
   color: var(--text);
   padding: 10px;
+}
+
+select {
+  appearance: none;
+  background-image: linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position: calc(100% - 18px) calc(1em + 2px), calc(100% - 12px) calc(1em + 2px);
+  background-size: 6px 6px, 6px 6px;
+  background-repeat: no-repeat;
+  padding-right: 32px;
 }
 
 button {
@@ -106,6 +145,104 @@ button {
 
 button:active {
   transform: translateY(1px);
+}
+
+button.ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+
+button.danger {
+  background: var(--danger);
+  color: #111827;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.controls {
+  margin-top: 24px;
+}
+
+.controls-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+
+.controls-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.controls-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.controls-move {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.selected-task {
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  white-space: pre-line;
+  min-height: 48px;
+}
+
+.filters {
+  margin-top: 24px;
+}
+
+.filters-card {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  display: grid;
+  gap: 12px;
+}
+
+.filters-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.filters-row {
+  display: grid;
+  grid-template-columns: 2fr 1fr auto auto;
+  gap: 12px;
+  align-items: end;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.checkbox input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
 }
 
 .week {
@@ -140,11 +277,16 @@ button:active {
 }
 
 .day-card {
-  background: rgba(15, 23, 42, 0.8);
+  background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 12px;
   min-height: 240px;
+}
+
+.day-card.drag-over {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 1px var(--accent-2);
 }
 
 .day-card h3 {
@@ -155,9 +297,29 @@ button:active {
 .task {
   padding: 8px;
   border-radius: 10px;
-  background: rgba(31, 41, 55, 0.8);
+  background: var(--surface-2);
   margin-bottom: 8px;
   border: 1px solid transparent;
+  cursor: pointer;
+}
+
+.task.editing {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 1px var(--accent-2);
+}
+
+.task-edit {
+  display: grid;
+  gap: 6px;
+}
+
+.task-edit-title,
+.task-edit-time {
+  width: 100%;
+}
+
+.task-edit input {
+  padding: 6px 8px;
 }
 
 .task time {
@@ -172,6 +334,12 @@ button:active {
   margin-top: 4px;
 }
 
+.task.selected,
+.backlog-item.selected {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 1px var(--accent-2);
+}
+
 .task.done {
   opacity: 0.5;
   text-decoration: line-through;
@@ -179,10 +347,15 @@ button:active {
 
 .backlog {
   margin-top: 32px;
-  background: rgba(15, 23, 42, 0.8);
+  background: var(--surface-1);
   border: 1px solid var(--border);
   border-radius: 12px;
   padding: 16px;
+}
+
+.backlog.drag-over {
+  border-color: var(--accent-2);
+  box-shadow: 0 0 0 1px var(--accent-2);
 }
 
 .backlog-list {
@@ -194,9 +367,10 @@ button:active {
 .backlog-item {
   padding: 10px 12px;
   border-radius: 10px;
-  background: rgba(31, 41, 55, 0.7);
+  background: var(--surface-2);
   border: 1px solid var(--border);
   color: var(--text);
+  cursor: pointer;
 }
 
 .backlog-meta {
@@ -212,10 +386,22 @@ button:active {
   .week-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
+  .controls-move {
+    grid-template-columns: 1fr 1fr;
+  }
+  .filters-row {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 @media (max-width: 600px) {
   .week-grid {
+    grid-template-columns: 1fr;
+  }
+  .controls-move {
+    grid-template-columns: 1fr;
+  }
+  .filters-row {
     grid-template-columns: 1fr;
   }
 }

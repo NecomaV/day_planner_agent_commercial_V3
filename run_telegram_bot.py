@@ -225,6 +225,23 @@ def _looks_like_greeting(text: str) -> bool:
     }
 
 
+def _parse_clear_targets(text: str) -> list[str]:
+    lower = text.lower()
+    targets = []
+    if any(word in lower for word in ["задач", "task", "tasks"]):
+        targets.append("tasks")
+    if any(word in lower for word in ["рутин", "routine", "routine", "утрен"]):
+        targets.append("routine")
+    return targets
+
+
+def _looks_like_clear_all(text: str) -> bool:
+    lower = text.lower()
+    has_clear = any(word in lower for word in ["удали", "удалить", "очисти", "очистить", "стереть", "clear", "wipe"])
+    has_all = any(word in lower for word in ["все", "полностью", "целиком", "all", "everything"])
+    return has_clear and has_all
+
+
 def _should_create_task(text: str) -> bool:
     lower = text.lower()
     triggers = [
@@ -253,6 +270,19 @@ def _append_chat_history(context: ContextTypes.DEFAULT_TYPE, role: str, content:
     history = context.user_data.get("chat_history") or []
     history.append({"role": role, "content": content})
     context.user_data["chat_history"] = history[-limit:]
+
+
+def _format_clear_targets(targets: list[str]) -> str:
+    parts = []
+    if "tasks" in targets:
+        parts.append("все задачи")
+    if "routine" in targets:
+        parts.append("все шаги рутины")
+    if len(parts) == 2:
+        return f"{parts[0]} и {parts[1]}"
+    if parts:
+        return parts[0]
+    return "все данные"
 
 
 def _build_assistant_context(db, user) -> str:
@@ -672,6 +702,53 @@ async def _handle_pending_action(
         return True
     context.user_data.pop("pending_action", None)
     return await _apply_task_actions(pending.get("action", ""), ids, update, db, user)
+
+
+async def _prompt_clear_all(
+    targets: list[str],
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    if not targets:
+        await update.message.reply_text(
+            "Что удалить? Напишите, например: удалить все задачи, удалить все шаги рутины."
+        )
+        return
+    context.user_data["pending_clear"] = {"targets": targets}
+    message = _format_clear_targets(targets)
+    await update.message.reply_text(f"Подтвердите: удалить {message}? (да/нет)")
+
+
+async def _handle_pending_clear(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+) -> bool:
+    pending = context.user_data.get("pending_clear")
+    if not pending:
+        return False
+    answer = _parse_yes_no(text)
+    if answer is None:
+        await update.message.reply_text("Ответьте <да> или <нет>.")
+        return True
+    context.user_data.pop("pending_clear", None)
+    if not answer:
+        await update.message.reply_text("Ок, ничего не удаляю.")
+        return True
+
+    targets = pending.get("targets") or []
+    count_tasks = 0
+    count_steps = 0
+    if "tasks" in targets:
+        count_tasks = crud.delete_all_tasks(db, user.id)
+    if "routine" in targets:
+        count_steps = crud.delete_all_routine_steps(db, user.id)
+    await update.message.reply_text(
+        f"Готово. Удалено задач: {count_tasks}, шагов рутины: {count_steps}."
+    )
+    return True
 
 
 async def _run_command_by_name(
@@ -1142,6 +1219,9 @@ async def _process_user_text(
     if await _handle_pending_action(text, update, context, db, user, routine):
         return
 
+    if await _handle_pending_clear(text, update, context, db, user):
+        return
+
     if await _handle_pending_suggestion(text, update, context, db, user):
         return
 
@@ -1162,6 +1242,11 @@ async def _process_user_text(
 
     if _looks_like_greeting(text):
         await update.message.reply_text("Привет! Чем помочь?")
+        return
+
+    if _looks_like_clear_all(text):
+        targets = _parse_clear_targets(text)
+        await _prompt_clear_all(targets, update, context)
         return
 
     suggestion = _detect_suggestion(text)
@@ -1412,6 +1497,22 @@ async def _handle_ai_intent(
         scheduled = [t for t in tasks if t.planned_start and not t.is_done]
         backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
         await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine))
+        return True
+
+    if intent == "clear_all":
+        raw_targets = data.get("targets") or []
+        if isinstance(raw_targets, str):
+            raw_targets = _split_items(raw_targets)
+        targets: list[str] = []
+        for item in raw_targets:
+            token = str(item).lower()
+            if "task" in token or "задач" in token:
+                targets.append("tasks")
+            if "rout" in token or "рут" in token or "утрен" in token:
+                targets.append("routine")
+        if not targets:
+            targets = _parse_clear_targets(original_text)
+        await _prompt_clear_all(targets, update, context)
         return True
 
     if intent == "command":
@@ -1686,12 +1787,13 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = await _get_user(update, db)
         api_key_hint = " + X-API-Key" if settings.API_KEY else ""
         tz = user.timezone or settings.TZ
+        cabinet_url = f"http://{settings.APP_HOST}:{settings.APP_PORT}/web"
         await update.message.reply_text(
             "Ваши данные для кабинета:\n"
             f"- user_id: {user.id}\n"
             f"- telegram_chat_id: {user.telegram_chat_id}\n"
             f"- часовой пояс: {tz}\n\n"
-            "Кабинет: http://127.0.0.1:8000/web\n"
+            f"Кабинет: {cabinet_url}\n"
             f"API заголовок: X-User-Id = user_id{api_key_hint}"
         )
 
@@ -1706,8 +1808,9 @@ async def cmd_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         routine = crud.get_routine(db, user.id)
         api_key_hint = " + X-API-Key" if settings.API_KEY else ""
         tz = user.timezone or settings.TZ
+        cabinet_url = f"http://{settings.APP_HOST}:{settings.APP_PORT}/web"
         await update.message.reply_text(
-            "Кабинет: http://127.0.0.1:8000/web\n"
+            f"Кабинет: {cabinet_url}\n"
             f"API заголовок: X-User-Id = user_id{api_key_hint}\n\n"
             "Профиль:\n"
             f"- id: {user.id}\n"

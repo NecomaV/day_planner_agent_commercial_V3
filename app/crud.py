@@ -305,6 +305,15 @@ def delete_task(db: Session, user_id: int, task_id: int) -> bool:
     return True
 
 
+def delete_all_tasks(db: Session, user_id: int) -> int:
+    tasks = list(db.execute(select(Task).where(Task.user_id == user_id)).scalars())
+    for task in tasks:
+        db.delete(task)
+    if tasks:
+        db.commit()
+    return len(tasks)
+
+
 def get_task(db: Session, user_id: int, task_id: int) -> Task | None:
     return db.execute(select(Task).where(and_(Task.id == task_id, Task.user_id == user_id))).scalar_one_or_none()
 
@@ -620,6 +629,15 @@ def delete_routine_step(db: Session, user_id: int, step_id: int) -> bool:
     db.delete(step)
     db.commit()
     return True
+
+
+def delete_all_routine_steps(db: Session, user_id: int) -> int:
+    steps = list(db.execute(select(RoutineStep).where(RoutineStep.user_id == user_id)).scalars())
+    for step in steps:
+        db.delete(step)
+    if steps:
+        db.commit()
+    return len(steps)
 
 
 def list_pantry_items(db: Session, user_id: int) -> list[PantryItem]:
