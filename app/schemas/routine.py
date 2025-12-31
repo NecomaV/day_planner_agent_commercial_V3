@@ -44,6 +44,11 @@ class RoutineOut(BaseModel):
     workout_rest_days: int
     workout_no_sunday: bool
 
+    workday_start: str
+    workday_end: str
+    latest_task_end: str | None
+    task_buffer_after_min: int
+
     class Config:
         from_attributes = True
 
@@ -73,6 +78,11 @@ class RoutinePatch(BaseModel):
     workout_rest_days: int | None = Field(default=None, ge=0, le=7)
     workout_no_sunday: bool | None = None
 
+    workday_start: str | None = None
+    workday_end: str | None = None
+    latest_task_end: str | None = None
+    task_buffer_after_min: int | None = Field(default=None, ge=0, le=60)
+
     @field_validator(
         "sleep_target_bedtime",
         "sleep_target_wakeup",
@@ -86,6 +96,9 @@ class RoutinePatch(BaseModel):
         "dinner_window_end",
         "workout_start_window",
         "workout_end_window",
+        "workday_start",
+        "workday_end",
+        "latest_task_end",
     )
     @classmethod
     def _time_fields(cls, v: str | None) -> str | None:

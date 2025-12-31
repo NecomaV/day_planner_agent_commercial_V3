@@ -1,0 +1,57 @@
+﻿<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Day Planner Cabinet</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/web/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Business Assistant</p>
+          <h1>Day Planner Cabinet</h1>
+          <p class="lead">Здесь ваши планы, быстрый доступ к расписанию и списку задач.</p>
+        </div>
+        <div class="auth">
+          <label>
+            ID пользователя
+            <input id="userId" type="number" placeholder="например 1" />
+          </label>
+          <label>
+            API ключ
+            <input id="apiKey" type="password" placeholder="если задан" />
+          </label>
+          <button id="loadWeek">Загрузить неделю</button>
+        </div>
+        <div id="status" class="status" role="status"></div>
+      </header>
+
+      <section class="week">
+        <div class="week-header">
+          <h2>Неделя</h2>
+          <div class="week-controls">
+            <button id="prevWeek">&lt;</button>
+            <div id="weekLabel"></div>
+            <button id="nextWeek">&gt;</button>
+          </div>
+        </div>
+        <div id="weekGrid" class="week-grid"></div>
+      </section>
+
+      <section class="backlog">
+        <h2>Бэклог</h2>
+        <div id="backlogList" class="backlog-list">Пока пусто.</div>
+      </section>
+    </main>
+
+    <script src="/web/app.js"></script>
+  </body>
+</html>

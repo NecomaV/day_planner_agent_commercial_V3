@@ -6,6 +6,7 @@ from .user import User
 from .routine import RoutineConfig
 from .task import Task
 from .workout import WorkoutPlan
+from .health import DailyCheckin, Habit, HabitLog
 
 __all__ = [
     "Base",
@@ -16,4 +17,7 @@ __all__ = [
     "TaskChecklist",
     "PantryItem",
     "WorkoutPlan",
+    "DailyCheckin",
+    "Habit",
+    "HabitLog",
 ]

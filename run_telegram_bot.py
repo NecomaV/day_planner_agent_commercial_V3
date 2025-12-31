@@ -6,6 +6,7 @@ Loads environment variables from .env automatically (project root).
 from __future__ import annotations
 
 import datetime as dt
+import math
 import logging
 import re
 import tempfile
@@ -79,6 +80,135 @@ def _extract_task_ids(text: str) -> list[int]:
     return [int(x) for x in re.findall(r"\b\d+\b", text)]
 
 
+def _is_skip(text: str) -> bool:
+    return text.strip().lower() in {"skip", "later", "пропустить", "потом", "не знаю", "не уверен"}
+
+
+def _parse_yes_no(text: str) -> bool | None:
+    lower = text.strip().lower()
+    if lower in {"да", "ага", "конечно", "yes", "y", "ok", "ок"}:
+        return True
+    if lower in {"нет", "неа", "no", "n"}:
+        return False
+    return None
+
+
+def _parse_int_value(text: str) -> int | None:
+    m = re.search(r"\b(\d{1,4})\b", text)
+    if not m:
+        return None
+    return int(m.group(1))
+
+
+def _parse_float_value(text: str) -> float | None:
+    m = re.search(r"\b(\d{1,2}(?:[.,]\d{1,2})?)\b", text)
+    if not m:
+        return None
+    return float(m.group(1).replace(",", "."))
+
+
+def _is_no_due(text: str) -> bool:
+    lower = text.strip().lower()
+    return lower in {"без срока", "нет срока", "без дедлайна", "no due", "no deadline"}
+
+
+def _distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371000
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r * c
+
+
+def _extract_person_name(text: str) -> str | None:
+    m = re.search(r"\b(?:с|со)\s+([А-Яа-яA-Za-z][^,.;!?]+)", text)
+    if not m:
+        return None
+    name = m.group(1).strip()
+    return name[:80] if name else None
+
+
+def _detect_suggestion(text: str) -> dict | None:
+    lower = text.lower()
+    if any(x in lower for x in ["звонок", "созвон", "созвонился", "созвонилась", "call"]):
+        name = _extract_person_name(text)
+        return {"type": "followup", "name": name}
+    if any(x in lower for x in ["встреча", "митинг", "meeting", "переговор"]):
+        return {"type": "prep", "raw": text}
+    return None
+
+
+async def _handle_pending_suggestion(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+) -> bool:
+    pending = context.user_data.get("pending_suggestion")
+    if not pending:
+        return False
+    answer = _parse_yes_no(text)
+    if answer is None:
+        await update.message.reply_text("Ответьте «да» или «нет».")
+        return True
+    context.user_data.pop("pending_suggestion", None)
+    if not answer:
+        await update.message.reply_text("Ок, без задачи.")
+        return True
+
+    now = _now_local_naive()
+    if pending.get("type") == "followup":
+        name = pending.get("name") or "контакту"
+        due_day = now.date() + dt.timedelta(days=max(0, settings.CALL_FOLLOWUP_DAYS))
+        due_at = dt.datetime.combine(due_day, dt.time(9, 0))
+        task = crud.create_task_fields(
+            db,
+            user.id,
+            title=f"Фоллоу-ап по {name}",
+            notes=None,
+            due_at=due_at,
+            priority=2,
+            estimate_minutes=15,
+            task_type="user",
+            schedule_source="assistant",
+            idempotency_key=None,
+        )
+        crud.add_checklist_items(db, task.id, [f"Отправить резюме {name}"])
+        await update.message.reply_text(f"Создан фоллоу-ап (id={task.id}).")
+        return True
+
+    if pending.get("type") == "prep":
+        raw = pending.get("raw") or ""
+        parsed = parse_quick_task(raw, now)
+        due_at = None
+        if parsed.due_at:
+            due_at = parsed.due_at - dt.timedelta(hours=1)
+            if due_at < now:
+                due_at = parsed.due_at
+        else:
+            due_at = dt.datetime.combine(now.date() + dt.timedelta(days=1), dt.time(10, 0))
+        task = crud.create_task_fields(
+            db,
+            user.id,
+            title="Подготовиться к встрече",
+            notes=None,
+            due_at=due_at,
+            priority=2,
+            estimate_minutes=30,
+            task_type="user",
+            schedule_source="assistant",
+            idempotency_key=None,
+        )
+        await update.message.reply_text(f"Создана задача подготовки (id={task.id}).")
+        return True
+
+    return True
+
+
 def _looks_like_greeting(text: str) -> bool:
     lower = re.sub(r"[^\w\s]", "", text.strip().lower())
     return lower in {
@@ -134,9 +264,15 @@ def _build_assistant_context(db, user) -> str:
     backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
     scheduled.sort(key=lambda t: t.planned_start)
 
+    display_name = user.full_name or "пользователь"
     lines = [
-        f"Дата и время: {now.strftime('%Y-%m-%d %H:%M')} ({settings.TZ})",
+        f"Пользователь: {display_name}",
+        f"Фокус: {user.primary_focus or 'не задан'}",
+        f"Дата и время: {now.strftime('%Y-%m-%d %H:%M')} ({user.timezone or settings.TZ})",
         f"Цели сна: подъем {routine.sleep_target_wakeup}, сон {routine.sleep_target_bedtime}",
+        f"Рабочий день: {routine.workday_start}-{routine.workday_end}",
+        f"Ограничение по времени: {routine.latest_task_end or 'нет'}",
+        f"Буфер между задачами: {routine.task_buffer_after_min} мин",
         f"Запланировано на сегодня: {len(scheduled)}",
     ]
     if scheduled:
@@ -202,6 +338,33 @@ def _parse_weekday(value: str) -> int | None:
         "воскресенье": 6,
     }
     return mapping.get(value)
+
+
+def _parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
+    lower = text.lower()
+    range_match = re.search(
+        r"(?:с\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:-|–|—|до)\s*(\d{1,2})(?::(\d{2}))?",
+        lower,
+    )
+    if not range_match:
+        return None
+    meridian_pm = bool(re.search(r"\b(pm|вечера|дня)\b", lower))
+    meridian_am = bool(re.search(r"\b(am|утра|ночи)\b", lower))
+
+    def apply_meridian(hh: int) -> int:
+        if meridian_pm and hh < 12:
+            return hh + 12
+        if meridian_am and hh == 12:
+            return 0
+        return hh
+
+    h1 = apply_meridian(int(range_match.group(1)))
+    m1 = int(range_match.group(2) or 0)
+    h2 = apply_meridian(int(range_match.group(3)))
+    m2 = int(range_match.group(4) or 0)
+    if h1 > 23 or m1 > 59 or h2 > 23 or m2 > 59:
+        return None
+    return dt.time(h1, m1), dt.time(h2, m2)
 
 
 def _parse_time_value(text: str) -> dt.time | None:
@@ -399,6 +562,44 @@ async def _prompt_task_selection(action: str, update: Update, context: ContextTy
     await update.message.reply_text("\n".join(lines))
 
 
+def _suggest_slot_for_task(db, user_id: int, routine, task) -> tuple[dt.date, dt.datetime, dt.datetime] | None:
+    now = _now_local_naive()
+    duration = dt.timedelta(minutes=task_display_minutes(task, routine))
+    for offset in range(0, 3):
+        day = now.date() + dt.timedelta(days=offset)
+        gaps, _, _ = _gaps_for_day(db, user_id, day, routine)
+        for gap in gaps:
+            if gap.end - gap.start >= duration:
+                start = gap.start
+                end = start + duration
+                return day, start, end
+    return None
+
+
+async def _offer_schedule(
+    task,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+    routine,
+) -> None:
+    suggestion = _suggest_slot_for_task(db, user.id, routine, task)
+    if not suggestion:
+        await update.message.reply_text("Задача добавлена в бэклог. Свободных слотов не найдено.")
+        return
+    day, start, end = suggestion
+    context.user_data["pending_schedule"] = {
+        "task_id": task.id,
+        "start": start,
+        "end": end,
+        "day": day,
+    }
+    await update.message.reply_text(
+        f"Нашел слот {day.isoformat()} {start.strftime('%H:%M')}-{end.strftime('%H:%M')}. Поставить? (да/нет)"
+    )
+
+
 async def _apply_task_actions(action: str, task_ids: list[int], update: Update, db, user) -> bool:
     if not task_ids:
         return False
@@ -494,8 +695,13 @@ async def _run_command_by_name(
         "routine_del": cmd_routine_del,
         "pantry": cmd_pantry,
         "breakfast": cmd_breakfast,
+        "health": cmd_health,
+        "habit": cmd_habit,
         "workout": cmd_workout,
+        "task_location": cmd_task_location,
+        "delay": cmd_delay,
         "cabinet": cmd_cabinet,
+        "setup": cmd_setup,
         "login": cmd_login,
         "logout": cmd_logout,
         "done": cmd_done,
@@ -517,8 +723,10 @@ async def _run_command_by_name(
     return True
 
 async def _start_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["onboarding_step"] = "wake"
-    await update.message.reply_text("Добро пожаловать! Во сколько обычно просыпаетесь? (HH:MM). Можно написать «пропустить».")
+    context.user_data["onboarding_step"] = "name"
+    await update.message.reply_text(
+        "Добро пожаловать! Давайте настроим профиль. Как вас зовут? (можно написать «пропустить»)"
+    )
 
 
 def _apply_wake_time(routine, wake_str: str) -> None:
@@ -532,6 +740,31 @@ def _apply_wake_time(routine, wake_str: str) -> None:
     b_end = (base + dt.timedelta(hours=3)).time().strftime("%H:%M")
     routine.breakfast_window_start = b_start
     routine.breakfast_window_end = b_end
+
+
+def _set_meal_window(routine, meal: str, t: dt.time, before_min: int = 60, after_min: int = 60) -> None:
+    base = t.hour * 60 + t.minute
+    start_min = max(0, base - before_min)
+    end_min = min(23 * 60 + 59, base + after_min)
+    start = dt.time(start_min // 60, start_min % 60).strftime("%H:%M")
+    end = dt.time(end_min // 60, end_min % 60).strftime("%H:%M")
+    if meal == "lunch":
+        routine.lunch_window_start = start
+        routine.lunch_window_end = end
+    elif meal == "dinner":
+        routine.dinner_window_start = start
+        routine.dinner_window_end = end
+
+
+def _set_meal_window_range(routine, meal: str, start: dt.time, end: dt.time) -> None:
+    start_str = start.strftime("%H:%M")
+    end_str = end.strftime("%H:%M")
+    if meal == "lunch":
+        routine.lunch_window_start = start_str
+        routine.lunch_window_end = end_str
+    elif meal == "dinner":
+        routine.dinner_window_start = start_str
+        routine.dinner_window_end = end_str
 
 
 def _suggest_routine_steps(goal: str) -> list[str]:
@@ -562,10 +795,32 @@ async def _handle_onboarding_text(
 
     routine = crud.get_routine(db, user.id)
 
+    if step == "name":
+        if _is_skip(text):
+            user.full_name = None
+        else:
+            user.full_name = text.strip()[:120]
+        db.add(user)
+        db.commit()
+        context.user_data["onboarding_step"] = "timezone"
+        await update.message.reply_text(
+            "Ваш часовой пояс? Например: Europe/Moscow или Asia/Almaty (можно «пропустить»)."
+        )
+        return True
+
+    if step == "timezone":
+        if not _is_skip(text):
+            user.timezone = text.strip()
+        db.add(user)
+        db.commit()
+        context.user_data["onboarding_step"] = "wake"
+        await update.message.reply_text("Во сколько обычно просыпаетесь? (HH:MM)")
+        return True
+
     if step == "wake":
-        if text.strip().lower() in {"skip", "later", "пропустить", "потом", "не знаю"}:
-            context.user_data["onboarding_step"] = "goal"
-            await update.message.reply_text("Какой сейчас главный фокус? (работа, фитнес, семья, учеба, другое)")
+        if _is_skip(text):
+            context.user_data["onboarding_step"] = "bed"
+            await update.message.reply_text("Во сколько обычно ложитесь спать? (HH:MM)")
             return True
         t = _parse_time_value(text) or None
         if not t:
@@ -580,9 +835,9 @@ async def _handle_onboarding_text(
         return True
 
     if step == "bed":
-        if text.strip().lower() in {"skip", "later", "пропустить", "потом", "не знаю"}:
-            context.user_data["onboarding_step"] = "goal"
-            await update.message.reply_text("Какой сейчас главный фокус? (работа, фитнес, семья, учеба, другое)")
+        if _is_skip(text):
+            context.user_data["onboarding_step"] = "workday"
+            await update.message.reply_text("Во сколько обычно рабочий день? Например 09:00-18:00 (можно «пропустить»).")
             return True
         t = _parse_time_value(text) or None
         if not t:
@@ -592,19 +847,155 @@ async def _handle_onboarding_text(
         routine.sleep_target_bedtime = bed_str
         db.add(routine)
         db.commit()
+        context.user_data["onboarding_step"] = "workday"
+        await update.message.reply_text("Во сколько обычно рабочий день? Например 09:00-18:00 (можно «пропустить»).")
+        return True
+
+    if step == "workday":
+        if not _is_skip(text):
+            time_range = _parse_time_range(text)
+            if not time_range:
+                await update.message.reply_text("Нужен диапазон времени, например 09:00-18:00")
+                return True
+            start, end = time_range
+            routine.workday_start = start.strftime("%H:%M")
+            routine.workday_end = end.strftime("%H:%M")
+            db.add(routine)
+            db.commit()
+        context.user_data["onboarding_step"] = "latest_end"
+        await update.message.reply_text("До какого времени можно ставить задачи? (HH:MM или «пропустить»)")
+        return True
+
+    if step == "latest_end":
+        if not _is_skip(text):
+            t = _parse_time_value(text) or None
+            if not t:
+                await update.message.reply_text("Введите время в формате HH:MM, например 19:00")
+                return True
+            routine.latest_task_end = f"{t.hour:02d}:{t.minute:02d}"
+            db.add(routine)
+            db.commit()
+        context.user_data["onboarding_step"] = "task_buffer"
+        await update.message.reply_text("Нужен буфер между задачами? Сколько минут? (например 15)")
+        return True
+
+    if step == "task_buffer":
+        if not _is_skip(text):
+            minutes = _parse_int_value(text)
+            if minutes is None:
+                await update.message.reply_text("Введите число минут, например 15")
+                return True
+            routine.task_buffer_after_min = max(0, minutes)
+            db.add(routine)
+            db.commit()
+        context.user_data["onboarding_step"] = "lunch"
+        await update.message.reply_text("Во сколько обычно обедаете? (HH:MM или диапазон)")
+        return True
+
+    if step == "lunch":
+        if not _is_skip(text):
+            time_range = _parse_time_range(text)
+            if time_range:
+                _set_meal_window_range(routine, "lunch", time_range[0], time_range[1])
+            else:
+                t = _parse_time_value(text) or None
+                if not t:
+                    await update.message.reply_text("Введите время в формате HH:MM, например 13:00")
+                    return True
+                _set_meal_window(routine, "lunch", t)
+            db.add(routine)
+            db.commit()
+        context.user_data["onboarding_step"] = "dinner"
+        await update.message.reply_text("Во сколько обычно ужинаете? (HH:MM или диапазон)")
+        return True
+
+    if step == "dinner":
+        if not _is_skip(text):
+            time_range = _parse_time_range(text)
+            if time_range:
+                _set_meal_window_range(routine, "dinner", time_range[0], time_range[1])
+            else:
+                t = _parse_time_value(text) or None
+                if not t:
+                    await update.message.reply_text("Введите время в формате HH:MM, например 19:30")
+                    return True
+                _set_meal_window(routine, "dinner", t)
+            db.add(routine)
+            db.commit()
+        context.user_data["onboarding_step"] = "workout_enabled"
+        await update.message.reply_text("Есть тренировки? (да/нет)")
+        return True
+
+    if step == "workout_enabled":
+        if _is_skip(text):
+            enabled = routine.workout_enabled
+        else:
+            enabled = _parse_yes_no(text)
+            if enabled is None:
+                await update.message.reply_text("Ответьте «да» или «нет».")
+                return True
+        routine.workout_enabled = bool(enabled)
+        db.add(routine)
+        db.commit()
+        if not routine.workout_enabled:
+            context.user_data["onboarding_step"] = "goal"
+            await update.message.reply_text("Какой сейчас главный фокус? (работа, фитнес, семья, учеба, другое)")
+            return True
+        context.user_data["onboarding_step"] = "workout_block"
+        await update.message.reply_text("Сколько минут длится тренировка с душем? (например 90)")
+        return True
+
+    if step == "workout_block":
+        if not _is_skip(text):
+            minutes = _parse_int_value(text)
+            if minutes is None:
+                await update.message.reply_text("Введите число минут, например 90")
+                return True
+            routine.workout_block_min = max(30, minutes)
+            db.add(routine)
+            db.commit()
+        context.user_data["onboarding_step"] = "workout_travel"
+        await update.message.reply_text("Сколько минут на дорогу в одну сторону? (например 15)")
+        return True
+
+    if step == "workout_travel":
+        if not _is_skip(text):
+            minutes = _parse_int_value(text)
+            if minutes is None:
+                await update.message.reply_text("Введите число минут, например 15")
+                return True
+            routine.workout_travel_oneway_min = max(0, minutes)
+            db.add(routine)
+            db.commit()
+        context.user_data["onboarding_step"] = "workout_sunday"
+        await update.message.reply_text("Тренируетесь по воскресеньям? (да/нет)")
+        return True
+
+    if step == "workout_sunday":
+        if not _is_skip(text):
+            yes = _parse_yes_no(text)
+            if yes is None:
+                await update.message.reply_text("Ответьте «да» или «нет».")
+                return True
+            routine.workout_no_sunday = not yes
+            db.add(routine)
+            db.commit()
         context.user_data["onboarding_step"] = "goal"
         await update.message.reply_text("Какой сейчас главный фокус? (работа, фитнес, семья, учеба, другое)")
         return True
 
     if step == "goal":
-        answer = text.strip().lower()
-        if answer in {"skip", "later", "пропустить", "потом", "не знаю"}:
+        answer = text.strip()
+        if _is_skip(text):
             user.onboarded = True
             db.add(user)
             db.commit()
             context.user_data.pop("onboarding_step", None)
             await update.message.reply_text("Готово. Теперь можно отправлять задачи или использовать /morning.")
             return True
+        user.primary_focus = answer[:120]
+        db.add(user)
+        db.commit()
         suggestions = suggest_routine_steps(
             answer,
             settings.OPENAI_API_KEY,
@@ -615,7 +1006,7 @@ async def _handle_onboarding_text(
         suggestion_text = ", ".join(suggestions)
         await update.message.reply_text(
             "Предлагаемая рутина: " + suggestion_text + "\n"
-            "Ответьте «да», чтобы принять, или пришлите свой список."
+            "Ответьте <да>, чтобы принять, или пришлите свой список."
         )
         return True
 
@@ -662,6 +1053,77 @@ async def _handle_onboarding_text(
     return False
 
 
+async def _handle_pending_schedule(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+) -> bool:
+    pending = context.user_data.get("pending_schedule")
+    if not pending:
+        return False
+    answer = _parse_yes_no(text)
+    if answer is None:
+        await update.message.reply_text("Ответьте «да» или «нет».")
+        return True
+    context.user_data.pop("pending_schedule", None)
+    if not answer:
+        await update.message.reply_text("Ок, оставил в бэклоге.")
+        return True
+    task_id = pending.get("task_id")
+    start = pending.get("start")
+    end = pending.get("end")
+    if not task_id or not start or not end:
+        await update.message.reply_text("Не удалось поставить задачу.")
+        return True
+    crud.update_task_fields(db, user.id, task_id, planned_start=start, planned_end=end, schedule_source="assistant")
+    await update.message.reply_text(f"Запланировано (id={task_id}) {start.strftime('%H:%M')}-{end.strftime('%H:%M')}")
+    return True
+
+
+async def _handle_pending_task(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+    routine,
+) -> bool:
+    pending = context.user_data.get("pending_task")
+    if not pending:
+        return False
+    if pending.get("step") != "due":
+        return False
+
+    if _is_no_due(text):
+        due_at = None
+    else:
+        parsed = parse_quick_task(text, _now_local_naive())
+        due_at = parsed.due_at
+        if parsed.title and parsed.title != text:
+            pending["title"] = pending.get("title") or parsed.title
+    if not _is_no_due(text) and due_at is None:
+        await update.message.reply_text("Не понял дедлайн. Пример: завтра в 15:00 или «без срока».")
+        return True
+
+    payload = TaskCreate(
+        title=pending.get("title") or "Задача",
+        notes=None,
+        estimate_minutes=int(pending.get("estimate") or 30),
+        planned_start=None,
+        planned_end=None,
+        due_at=due_at,
+        priority=2,
+        kind=None,
+        idempotency_key=None,
+    )
+    task = crud.create_task(db, user_id=user.id, data=payload)
+    context.user_data.pop("pending_task", None)
+    await update.message.reply_text("Задача создана. Ищу слот...")
+    await _offer_schedule(task, update, context, db, user, routine)
+    return True
+
 async def _process_user_text(
     text: str,
     update: Update,
@@ -672,7 +1134,16 @@ async def _process_user_text(
     routine = crud.get_routine(db, user.id)
     ai_enabled = bool(settings.OPENAI_API_KEY)
 
+    if await _handle_pending_schedule(text, update, context, db, user):
+        return
+
+    if await _handle_pending_task(text, update, context, db, user, routine):
+        return
+
     if await _handle_pending_action(text, update, context, db, user, routine):
+        return
+
+    if await _handle_pending_suggestion(text, update, context, db, user):
         return
 
     parsed_command = _parse_command_text(text)
@@ -693,6 +1164,16 @@ async def _process_user_text(
     if _looks_like_greeting(text):
         await update.message.reply_text("Привет! Чем помочь?")
         return
+
+    suggestion = _detect_suggestion(text)
+    if suggestion and not _should_create_task(text):
+        context.user_data["pending_suggestion"] = suggestion
+        if suggestion["type"] == "followup":
+            await update.message.reply_text("Создать фоллоу-ап по звонку? (да/нет)")
+            return
+        if suggestion["type"] == "prep":
+            await update.message.reply_text("Создать задачу подготовки к встрече? (да/нет)")
+            return
 
     if ai_enabled:
         data = parse_intent(text, settings.OPENAI_API_KEY, settings.OPENAI_CHAT_MODEL)
@@ -804,6 +1285,14 @@ async def _process_user_text(
         return
 
     parsed = parse_quick_task(text, _now_local_naive())
+    if parsed.due_at is None:
+        context.user_data["pending_task"] = {
+            "step": "due",
+            "title": parsed.title,
+            "estimate": 30,
+        }
+        await update.message.reply_text("Когда дедлайн? Можно ответить «без срока».")
+        return
     payload = TaskCreate(
         title=parsed.title,
         notes=None,
@@ -822,6 +1311,7 @@ async def _process_user_text(
     when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(без срока)"
     checklist_info = f" Чек-лист: {len(parsed.checklist_items)} пунктов." if parsed.checklist_items else ""
     await update.message.reply_text(f"Добавлено: {task.title}. Срок: {when}.{checklist_info}")
+    await _offer_schedule(task, update, context, db, user, routine)
 
 
 async def _handle_ai_intent(
@@ -948,6 +1438,14 @@ async def _handle_ai_intent(
         if not _should_create_task(original_text):
             return False
         parsed = parse_quick_task(text, _now_local_naive())
+        if parsed.due_at is None:
+            context.user_data["pending_task"] = {
+                "step": "due",
+                "title": parsed.title,
+                "estimate": 30,
+            }
+            await update.message.reply_text("Когда дедлайн? Можно ответить «без срока».")
+            return True
         payload = TaskCreate(
             title=parsed.title,
             notes=None,
@@ -965,6 +1463,8 @@ async def _handle_ai_intent(
         when = parsed.due_at.strftime("%Y-%m-%d %H:%M") if parsed.due_at else "(без срока)"
         checklist_info = f" Чек-лист: {len(parsed.checklist_items)} пунктов." if parsed.checklist_items else ""
         await update.message.reply_text(f"Добавлено: {task.title}. Срок: {when}.{checklist_info}")
+        routine = crud.get_routine(db, user.id)
+        await _offer_schedule(task, update, context, db, user, routine)
         return True
 
     return False
@@ -1017,12 +1517,37 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         await _process_user_text(transcript, update, context, db, user)
 
+
+async def handle_location_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.location:
+        return
+    loc = update.message.location
+    now = _now_local_naive()
+    with get_db_session() as db:
+        user = await _get_active_user(update, context, db)
+        if not user:
+            return
+        crud.update_user_location(db, user.id, loc.latitude, loc.longitude, now)
+        pending = context.user_data.pop("pending_location", None)
+        if not pending:
+            await update.message.reply_text("Локация обновлена.")
+            return
+        task_id = pending.get("task_id")
+        radius = pending.get("radius")
+        label = pending.get("label")
+        task = crud.update_task_location(db, user.id, task_id, loc.latitude, loc.longitude, radius_m=radius, label=label)
+        if not task:
+            await update.message.reply_text("Задача не найдена.")
+            return
+        label_text = f" ({task.location_label})" if task.location_label else ""
+        await update.message.reply_text(f"Локация привязана к задаче id={task.id}{label_text}.")
+
 async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = _now_local_naive()
     with get_db_session() as db:
         tasks = crud.list_tasks_for_reminders(db, now, settings.REMINDER_LEAD_MIN)
         if not tasks:
-            return
+            tasks = []
 
         users = {u.id: u for u in crud.list_users(db)}
         grouped: dict[int, list] = defaultdict(list)
@@ -1048,6 +1573,65 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             for task in items:
                 task.reminder_sent_at = now
+
+        # Late prompt
+        late_tasks = crud.list_late_tasks(db, now, settings.DELAY_GRACE_MIN)
+        late_grouped: dict[int, list] = defaultdict(list)
+        for task in late_tasks:
+            late_grouped[task.user_id].append(task)
+
+        for user_id, items in late_grouped.items():
+            user = users.get(user_id)
+            if not user or not getattr(user, "is_active", True):
+                continue
+            try:
+                chat_id = int(user.telegram_chat_id)
+            except ValueError:
+                chat_id = user.telegram_chat_id
+            for task in items:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"Вы задерживаетесь по задаче: {task.title} (id={task.id}). "
+                            "Перенести? Используйте /delay <id> <минуты>."
+                        ),
+                    )
+                    task.late_prompt_sent_at = now
+                except Exception:
+                    continue
+
+        # Location-based reminders
+        for user_id, user in users.items():
+            if not getattr(user, "is_active", True):
+                continue
+            if user.last_lat is None or user.last_lon is None or user.last_location_at is None:
+                continue
+            if (now - user.last_location_at) > dt.timedelta(minutes=settings.LOCATION_STALE_MIN):
+                continue
+            tasks_with_location = crud.list_tasks_with_location(db, user_id)
+            if not tasks_with_location:
+                continue
+            try:
+                chat_id = int(user.telegram_chat_id)
+            except ValueError:
+                chat_id = user.telegram_chat_id
+            for task in tasks_with_location:
+                if task.location_reminder_sent_at is not None:
+                    continue
+                radius = task.location_radius_m or 150
+                dist = _distance_m(user.last_lat, user.last_lon, task.location_lat, task.location_lon)
+                if dist > radius:
+                    continue
+                label = f" ({task.location_label})" if task.location_label else ""
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=f"Вы рядом с локацией{label}. Задача: {task.title} (id={task.id})",
+                    )
+                    task.location_reminder_sent_at = now
+                except Exception:
+                    continue
 
         db.commit()
 
@@ -1079,8 +1663,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/routine_del <id> - удалить шаг рутины\n"
         "/pantry add|remove|list <продукт>\n"
         "/breakfast - предложить завтрак из продуктов\n"
+        "/health checkin|today - здоровье (сон/энергия/вода)\n"
+        "/habit add|log|list - привычки\n"
         "/workout today|show|set|clear|list ...\n"
+        "/task_location <id> [радиус] [метка] - привязать локацию к задаче\n"
+        "/delay <id> <минуты> - перенести задачу\n"
         "/cabinet - кабинет и статистика\n"
+        "/setup - пройти настройку заново\n"
         "/login - включить аккаунт\n"
         "/logout - выключить аккаунт\n"
         "/slots <id> [YYYY-MM-DD] - доступные слоты\n"
@@ -1114,14 +1703,33 @@ async def cmd_cabinet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         workouts = crud.list_workout_plans(db, user.id)
         status = "активен" if user.is_active else "неактивен"
         onboarded = "да" if user.onboarded else "нет"
+        routine = crud.get_routine(db, user.id)
         await update.message.reply_text(
             "Кабинет:\n"
+            f"- имя: {user.full_name or 'не задано'}\n"
+            f"- фокус: {user.primary_focus or 'не задан'}\n"
+            f"- часовой пояс: {user.timezone}\n"
+            f"- рабочий день: {routine.workday_start}-{routine.workday_end}\n"
+            f"- до какого времени задачи: {routine.latest_task_end or 'не задано'}\n"
+            f"- буфер между задачами: {routine.task_buffer_after_min} мин\n"
             f"- статус: {status}\n"
             f"- онбординг: {onboarded}\n"
             f"- шагов рутины: {len(steps)}\n"
             f"- продуктов в кладовой: {len(pantry)}\n"
             f"- планов тренировок: {len(workouts)}"
         )
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    with get_db_session() as db:
+        user = await _get_user(update, db)
+        user.onboarded = False
+        db.add(user)
+        db.commit()
+    context.user_data.pop("onboarding_step", None)
+    context.user_data.pop("chat_history", None)
+    await update.message.reply_text("Запускаю настройку заново.")
+    await _start_onboarding(update, context)
 
 
 async def cmd_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1385,6 +1993,191 @@ async def cmd_breakfast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         else:
             lines.append(f"- {s['name']} (все есть)")
     await update.message.reply_text("\n".join(lines))
+
+async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Использование: /health checkin|today ...")
+        return
+
+    action = context.args[0].lower()
+    args = context.args[1:]
+    day = _now_local_naive().date()
+
+    with get_db_session() as db:
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
+
+        if action == "checkin":
+            if len(args) < 2:
+                await update.message.reply_text("Использование: /health checkin <сон_часы> <энергия_1-5> [вода_мл]")
+                return
+            sleep = _parse_float_value(args[0])
+            energy = _parse_int_value(args[1])
+            water = _parse_int_value(args[2]) if len(args) >= 3 else None
+            if sleep is None or energy is None:
+                await update.message.reply_text("Пример: /health checkin 7.5 4 1500")
+                return
+            sleep_hours = sleep
+            energy_level = max(1, min(5, energy))
+            crud.upsert_daily_checkin(
+                db,
+                user.id,
+                day,
+                sleep_hours=sleep_hours,
+                energy_level=energy_level,
+                water_ml=water,
+            )
+            await update.message.reply_text("Чек‑ин сохранен.")
+            return
+
+        if action == "today":
+            checkin = crud.get_daily_checkin(db, user.id, day)
+            habits = crud.list_habits(db, user.id, active_only=True)
+            lines = ["Здоровье сегодня:"]
+            if checkin:
+                sleep_val = f"{checkin.sleep_hours:.1f}" if checkin.sleep_hours is not None else "—"
+                lines.append(f"- сон: {sleep_val} ч")
+                lines.append(f"- энергия: {checkin.energy_level or '—'}/5")
+                lines.append(f"- вода: {checkin.water_ml or '—'} мл")
+            else:
+                lines.append("- чек‑ина нет")
+            if habits:
+                lines.append("Привычки:")
+                for h in habits:
+                    total = crud.sum_habit_for_day(db, h.id, day)
+                    target = f"/{h.target_per_day}" if h.target_per_day else ""
+                    unit = f" {h.unit}" if h.unit else ""
+                    lines.append(f"- {h.name}: {total}{unit}{target}")
+            await update.message.reply_text("\n".join(lines))
+            return
+
+    await update.message.reply_text("Использование: /health checkin|today ...")
+
+
+async def cmd_habit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Использование: /habit add|log|list ...")
+        return
+
+    action = context.args[0].lower()
+    args = context.args[1:]
+    day = _now_local_naive().date()
+
+    with get_db_session() as db:
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
+
+        if action == "list":
+            habits = crud.list_habits(db, user.id, active_only=True)
+            if not habits:
+                await update.message.reply_text("Привычек пока нет. Используйте /habit add.")
+                return
+            lines = ["Привычки:"]
+            for h in habits:
+                target = f"/{h.target_per_day}" if h.target_per_day else ""
+                unit = f" {h.unit}" if h.unit else ""
+                lines.append(f"- {h.name} {target}{unit}".strip())
+            await update.message.reply_text("\n".join(lines))
+            return
+
+        if action == "add":
+            if not args:
+                await update.message.reply_text("Использование: /habit add <название> [цель] [единица]")
+                return
+            target = None
+            unit = None
+            if args and _parse_int_value(args[-1]) is not None:
+                target = _parse_int_value(args[-1])
+                args = args[:-1]
+                if args and args[-1].isalpha():
+                    unit = args[-1]
+                    args = args[:-1]
+            name = " ".join(args).strip()
+            if not name:
+                await update.message.reply_text("Название не может быть пустым.")
+                return
+            habit = crud.upsert_habit(db, user.id, name=name, target_per_day=target, unit=unit)
+            await update.message.reply_text(f"Привычка сохранена: {habit.name}")
+            return
+
+        if action == "log":
+            if not args:
+                await update.message.reply_text("Использование: /habit log <название> [значение]")
+                return
+            value = 1
+            if _parse_int_value(args[-1]) is not None:
+                value = _parse_int_value(args[-1]) or 1
+                args = args[:-1]
+            name = " ".join(args).strip()
+            if not name:
+                await update.message.reply_text("Название не может быть пустым.")
+                return
+            habit = crud.get_habit_by_name(db, user.id, name)
+            if not habit:
+                habit = crud.upsert_habit(db, user.id, name=name)
+            crud.log_habit(db, user.id, habit.id, day, value=value)
+            await update.message.reply_text(f"Записано: {habit.name} (+{value})")
+            return
+
+    await update.message.reply_text("Использование: /habit add|log|list ...")
+
+
+async def cmd_task_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Использование: /task_location <id> [радиус_м] [метка]")
+        return
+    try:
+        task_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("id должен быть числом")
+        return
+    radius = None
+    label_parts = context.args[1:]
+    if label_parts and _parse_int_value(label_parts[0]) is not None:
+        radius = _parse_int_value(label_parts[0])
+        label_parts = label_parts[1:]
+    label = " ".join(label_parts).strip() if label_parts else None
+    context.user_data["pending_location"] = {
+        "task_id": task_id,
+        "radius": radius or 150,
+        "label": label,
+    }
+    await update.message.reply_text("Отправьте геолокацию, чтобы привязать ее к задаче.")
+
+
+async def cmd_delay(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if len(context.args) < 2:
+        await update.message.reply_text("Использование: /delay <id> <минуты>")
+        return
+    try:
+        task_id = int(context.args[0])
+        minutes = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("id и минуты должны быть числами")
+        return
+    if minutes <= 0:
+        await update.message.reply_text("Минуты должны быть > 0")
+        return
+    with get_db_session() as db:
+        user = await _get_ready_user(update, context, db)
+        if not user:
+            return
+        task = crud.get_task(db, user.id, task_id)
+        if not task:
+            await update.message.reply_text("Задача не найдена")
+            return
+        if not task.planned_start or not task.planned_end:
+            await update.message.reply_text("У задачи нет времени, нечего сдвигать.")
+            return
+        delta = dt.timedelta(minutes=minutes)
+        new_start = task.planned_start + delta
+        new_end = task.planned_end + delta
+        crud.update_task_fields(db, user.id, task_id, planned_start=new_start, planned_end=new_end, schedule_source="assistant")
+        await update.message.reply_text(
+            f"Перенесено (id={task_id}) {new_start.strftime('%H:%M')}-{new_end.strftime('%H:%M')}"
+        )
 
 async def cmd_workout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
@@ -1883,8 +2676,13 @@ def main() -> None:
     app.add_handler(CommandHandler("routine_del", cmd_routine_del))
     app.add_handler(CommandHandler("pantry", cmd_pantry))
     app.add_handler(CommandHandler("breakfast", cmd_breakfast))
+    app.add_handler(CommandHandler("health", cmd_health))
+    app.add_handler(CommandHandler("habit", cmd_habit))
     app.add_handler(CommandHandler("workout", cmd_workout))
+    app.add_handler(CommandHandler("task_location", cmd_task_location))
+    app.add_handler(CommandHandler("delay", cmd_delay))
     app.add_handler(CommandHandler("cabinet", cmd_cabinet))
+    app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CommandHandler("login", cmd_login))
     app.add_handler(CommandHandler("logout", cmd_logout))
     app.add_handler(CommandHandler("done", cmd_done))
@@ -1895,6 +2693,7 @@ def main() -> None:
     app.add_handler(CommandHandler("schedule", cmd_schedule))
 
     app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location_message))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
 
     app.job_queue.run_repeating(reminder_job, interval=60, first=15)

@@ -31,6 +31,10 @@ class TaskCreate(BaseModel):
 
     kind: str | None = Field(default=None, description="meal|workout|morning|work|other")
     idempotency_key: str | None = Field(default=None, max_length=120)
+    location_label: str | None = Field(default=None, max_length=120)
+    location_lat: float | None = None
+    location_lon: float | None = None
+    location_radius_m: int | None = Field(default=None, ge=10, le=2000)
 
     @field_validator("title")
     @classmethod
@@ -65,6 +69,10 @@ class TaskUpdate(BaseModel):
     is_done: bool | None = None
 
     kind: str | None = Field(default=None, description="meal|workout|morning|work|other")
+    location_label: str | None = Field(default=None, max_length=120)
+    location_lat: float | None = None
+    location_lon: float | None = None
+    location_radius_m: int | None = Field(default=None, ge=10, le=2000)
 
     @field_validator("title")
     @classmethod
@@ -102,6 +110,12 @@ class TaskOut(BaseModel):
     planned_end: dt.datetime | None
     due_at: dt.datetime | None
     reminder_sent_at: dt.datetime | None
+    late_prompt_sent_at: dt.datetime | None
+    location_label: str | None
+    location_lat: float | None
+    location_lon: float | None
+    location_radius_m: int | None
+    location_reminder_sent_at: dt.datetime | None
 
     priority: int
     estimate_minutes: int
@@ -115,3 +129,10 @@ class PlanOut(BaseModel):
     date: str
     scheduled: list[TaskOut]
     backlog: list[TaskOut]
+
+
+class TaskLocationIn(BaseModel):
+    lat: float
+    lon: float
+    radius_m: int | None = Field(default=150, ge=10, le=2000)
+    label: str | None = Field(default=None, max_length=120)

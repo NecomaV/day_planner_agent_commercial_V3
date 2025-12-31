@@ -22,10 +22,12 @@ class Settings(BaseSettings):
     # Reminders
     REMINDER_LEAD_MIN: int = 10
     CALL_FOLLOWUP_DAYS: int = 1
+    DELAY_GRACE_MIN: int = 10
+    LOCATION_STALE_MIN: int = 60
 
     # AI (optional)
     OPENAI_API_KEY: str | None = None
-    OPENAI_TRANSCRIBE_MODEL: str = "whisper-1"
+    OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-mini-transcribe"
     OPENAI_CHAT_MODEL: str = "gpt-4o-mini"
     OPENAI_TRANSCRIBE_LANGUAGE: str = "ru"
 

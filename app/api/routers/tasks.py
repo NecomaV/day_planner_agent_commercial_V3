@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.api.deps import get_user_id, require_api_key
-from app.schemas.tasks import TaskCreate, TaskOut, TaskUpdate, PlanOut
+from app.schemas.tasks import TaskCreate, TaskOut, TaskUpdate, PlanOut, TaskLocationIn
 from app import crud
 
 router = APIRouter(prefix="/tasks", tags=["tasks"], dependencies=[Depends(require_api_key)])
@@ -57,3 +57,24 @@ def delete_task(task_id: int, db: Session = Depends(get_db), user_id: int = Depe
     if not ok:
         raise HTTPException(status_code=404, detail="Task not found")
     return {"ok": True}
+
+
+@router.post("/{task_id}/location", response_model=TaskOut)
+def set_task_location(
+    task_id: int,
+    payload: TaskLocationIn,
+    db: Session = Depends(get_db),
+    user_id: int = Depends(get_user_id),
+):
+    task = crud.update_task_location(
+        db,
+        user_id,
+        task_id,
+        lat=payload.lat,
+        lon=payload.lon,
+        radius_m=payload.radius_m,
+        label=payload.label,
+    )
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task

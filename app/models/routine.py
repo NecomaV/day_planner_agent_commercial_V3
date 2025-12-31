@@ -18,6 +18,14 @@ class RoutineConfig(Base):
     sleep_target_bedtime: Mapped[str] = mapped_column(String(5), default="23:45")
     sleep_target_wakeup: Mapped[str] = mapped_column(String(5), default="07:30")
 
+    # Workday
+    workday_start: Mapped[str] = mapped_column(String(5), default="09:00")
+    workday_end: Mapped[str] = mapped_column(String(5), default="18:00")
+
+    # Scheduling constraints
+    latest_task_end: Mapped[str | None] = mapped_column(String(5), nullable=True)
+    task_buffer_after_min: Mapped[int] = mapped_column(Integer, default=0)
+
     # Sleep hard bounds (used when generating anchors)
     sleep_latest_bedtime: Mapped[str] = mapped_column(String(5), default="01:00")
     sleep_earliest_wakeup: Mapped[str] = mapped_column(String(5), default="05:00")

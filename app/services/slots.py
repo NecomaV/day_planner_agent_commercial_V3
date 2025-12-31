@@ -61,6 +61,13 @@ def day_bounds(day: dt.date, routine, now: Optional[dt.datetime] = None) -> Tupl
     day_start = morning_end
 
     day_end = bed - dt.timedelta(minutes=routine.pre_sleep_buffer_min)
+    latest_end = getattr(routine, "latest_task_end", None)
+    if latest_end:
+        try:
+            end_limit = _combine(day, parse_hhmm(latest_end))
+            day_end = min(day_end, end_limit)
+        except Exception:
+            pass
 
     if now is not None and now.date() == day:
         day_start = max(day_start, _ceil_to_next_minute(now))
@@ -88,6 +95,7 @@ def _task_to_busy_interval(task, routine) -> Optional[Interval]:
 
     s = task.planned_start
     e = task.planned_end
+    buffer_after = int(getattr(routine, "task_buffer_after_min", 0) or 0)
 
     # Meals: buffer after
     if getattr(task, "kind", None) == "meal":
@@ -98,6 +106,9 @@ def _task_to_busy_interval(task, routine) -> Optional[Interval]:
         travel = dt.timedelta(minutes=routine.workout_travel_oneway_min)
         s = s - travel
         e = e + travel
+
+    if buffer_after > 0:
+        e = e + dt.timedelta(minutes=buffer_after)
 
     return Interval(s, e)
 

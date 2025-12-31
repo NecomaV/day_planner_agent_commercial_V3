@@ -1,5 +1,5 @@
 import datetime as dt
-from sqlalchemy import String, DateTime, Integer, Boolean, ForeignKey, Index, UniqueConstraint
+from sqlalchemy import String, DateTime, Integer, Boolean, ForeignKey, Index, UniqueConstraint, Float
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .base import Base
@@ -47,6 +47,14 @@ class Task(Base):
     # How the time was assigned: manual | autoplan | system
     schedule_source: Mapped[str] = mapped_column(String(20), default="manual", index=True)
     reminder_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    late_prompt_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # Location-based reminders
+    location_label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    location_lat: Mapped[float | None] = mapped_column(Float, nullable=True)
+    location_lon: Mapped[float | None] = mapped_column(Float, nullable=True)
+    location_radius_m: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    location_reminder_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Audit fields
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())

@@ -6,6 +6,7 @@ from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.models.checklist import TaskChecklist
+from app.models.health import DailyCheckin, Habit, HabitLog
 from app.models.pantry import PantryItem
 from app.models.routine import RoutineConfig
 from app.models.routine_step import RoutineStep
@@ -38,6 +39,34 @@ def get_or_create_user_by_chat_id(db: Session, chat_id: str, timezone: str = set
 
 def list_users(db: Session) -> list[User]:
     return list(db.execute(select(User).order_by(User.id.asc())).scalars())
+
+
+def get_user(db: Session, user_id: int) -> User | None:
+    return db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+
+
+def update_user_fields(db: Session, user_id: int, **fields) -> User | None:
+    allowed = {
+        "full_name",
+        "primary_focus",
+        "preferred_language",
+        "timezone",
+        "is_active",
+        "onboarded",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"Unknown user fields: {sorted(unknown)}")
+    user = get_user(db, user_id)
+    if not user:
+        return None
+    for key, value in fields.items():
+        if value is not None:
+            setattr(user, key, value)
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
 
 
 def set_user_active(db: Session, user_id: int, is_active: bool) -> User | None:
@@ -130,6 +159,10 @@ def create_task(db: Session, user_id: int, data: TaskCreate) -> Task:
         task_type="user",
         schedule_source="manual",
         idempotency_key=data.idempotency_key,
+        location_label=data.location_label,
+        location_lat=data.location_lat,
+        location_lon=data.location_lon,
+        location_radius_m=data.location_radius_m,
     )
     db.add(task)
     db.commit()
@@ -153,6 +186,10 @@ def create_task_fields(db: Session, user_id: int, **fields) -> Task:
         "schedule_source",
         "idempotency_key",
         "reminder_sent_at",
+        "location_label",
+        "location_lat",
+        "location_lon",
+        "location_radius_m",
     }
     unknown = set(fields) - allowed
     if unknown:
@@ -197,6 +234,10 @@ def create_task_fields(db: Session, user_id: int, **fields) -> Task:
         idempotency_key=idempotency_key,
         is_done=fields.get("is_done", False),
         reminder_sent_at=fields.get("reminder_sent_at"),
+        location_label=fields.get("location_label"),
+        location_lat=fields.get("location_lat"),
+        location_lon=fields.get("location_lon"),
+        location_radius_m=fields.get("location_radius_m"),
     )
     db.add(task)
     db.commit()
@@ -225,6 +266,12 @@ def update_task_fields(db: Session, user_id: int, task_id: int, **fields) -> Tas
         "schedule_source",
         "idempotency_key",
         "reminder_sent_at",
+        "late_prompt_sent_at",
+        "location_label",
+        "location_lat",
+        "location_lon",
+        "location_radius_m",
+        "location_reminder_sent_at",
     }
     unknown = set(fields) - allowed
     if unknown:
@@ -333,6 +380,178 @@ def list_tasks_for_reminders(db: Session, now: dt.datetime, lead_minutes: int) -
             .order_by(Task.planned_start.asc(), Task.due_at.asc(), Task.id.asc())
         ).scalars()
     )
+
+
+def list_tasks_with_location(db: Session, user_id: int) -> list[Task]:
+    return list(
+        db.execute(
+            select(Task).where(
+                and_(
+                    Task.user_id == user_id,
+                    Task.is_done.is_(False),
+                    Task.location_lat.is_not(None),
+                    Task.location_lon.is_not(None),
+                )
+            )
+        ).scalars()
+    )
+
+
+def list_late_tasks(db: Session, now: dt.datetime, grace_minutes: int) -> list[Task]:
+    if grace_minutes < 0:
+        grace_minutes = 0
+    threshold = now - dt.timedelta(minutes=grace_minutes)
+    return list(
+        db.execute(
+            select(Task).where(
+                and_(
+                    Task.is_done.is_(False),
+                    Task.planned_start.is_not(None),
+                    Task.planned_start <= threshold,
+                    Task.late_prompt_sent_at.is_(None),
+                )
+            )
+        ).scalars()
+    )
+
+
+def update_user_location(db: Session, user_id: int, lat: float, lon: float, at: dt.datetime) -> None:
+    user = db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+    if not user:
+        return
+    user.last_lat = lat
+    user.last_lon = lon
+    user.last_location_at = at
+    db.add(user)
+    db.commit()
+
+
+def update_task_location(
+    db: Session,
+    user_id: int,
+    task_id: int,
+    lat: float,
+    lon: float,
+    radius_m: int | None = None,
+    label: str | None = None,
+) -> Task | None:
+    task = db.execute(select(Task).where(and_(Task.id == task_id, Task.user_id == user_id))).scalar_one_or_none()
+    if not task:
+        return None
+    task.location_lat = lat
+    task.location_lon = lon
+    if radius_m is not None:
+        task.location_radius_m = radius_m
+    if label is not None:
+        task.location_label = label
+    task.location_reminder_sent_at = None
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    return task
+
+
+def get_daily_checkin(db: Session, user_id: int, day: dt.date) -> DailyCheckin | None:
+    return db.execute(
+        select(DailyCheckin).where(and_(DailyCheckin.user_id == user_id, DailyCheckin.day == day))
+    ).scalar_one_or_none()
+
+
+def upsert_daily_checkin(
+    db: Session,
+    user_id: int,
+    day: dt.date,
+    *,
+    sleep_hours: float | None = None,
+    energy_level: int | None = None,
+    water_ml: int | None = None,
+    notes: str | None = None,
+) -> DailyCheckin:
+    checkin = get_daily_checkin(db, user_id, day)
+    if not checkin:
+        checkin = DailyCheckin(
+            user_id=user_id,
+            day=day,
+            sleep_hours=sleep_hours,
+            energy_level=energy_level,
+            water_ml=water_ml,
+            notes=notes,
+        )
+        db.add(checkin)
+        db.commit()
+        db.refresh(checkin)
+        return checkin
+    if sleep_hours is not None:
+        checkin.sleep_hours = sleep_hours
+    if energy_level is not None:
+        checkin.energy_level = energy_level
+    if water_ml is not None:
+        checkin.water_ml = water_ml
+    if notes is not None:
+        checkin.notes = notes
+    db.add(checkin)
+    db.commit()
+    db.refresh(checkin)
+    return checkin
+
+
+def list_habits(db: Session, user_id: int, active_only: bool = True) -> list[Habit]:
+    stmt = select(Habit).where(Habit.user_id == user_id)
+    if active_only:
+        stmt = stmt.where(Habit.is_active.is_(True))
+    return list(db.execute(stmt.order_by(Habit.name.asc())).scalars())
+
+
+def get_habit_by_name(db: Session, user_id: int, name: str) -> Habit | None:
+    return db.execute(
+        select(Habit).where(and_(Habit.user_id == user_id, Habit.name == name.strip()))
+    ).scalar_one_or_none()
+
+
+def get_habit(db: Session, user_id: int, habit_id: int) -> Habit | None:
+    return db.execute(
+        select(Habit).where(and_(Habit.user_id == user_id, Habit.id == habit_id))
+    ).scalar_one_or_none()
+
+
+def upsert_habit(
+    db: Session,
+    user_id: int,
+    name: str,
+    *,
+    target_per_day: int | None = None,
+    unit: str | None = None,
+) -> Habit:
+    name = name.strip()
+    habit = get_habit_by_name(db, user_id, name)
+    if habit:
+        if target_per_day is not None:
+            habit.target_per_day = target_per_day
+        if unit is not None:
+            habit.unit = unit
+        habit.is_active = True
+        db.add(habit)
+        db.commit()
+        db.refresh(habit)
+        return habit
+    habit = Habit(user_id=user_id, name=name, target_per_day=target_per_day, unit=unit, is_active=True)
+    db.add(habit)
+    db.commit()
+    db.refresh(habit)
+    return habit
+
+
+def log_habit(db: Session, user_id: int, habit_id: int, day: dt.date, value: int = 1) -> HabitLog:
+    log = HabitLog(user_id=user_id, habit_id=habit_id, day=day, value=value)
+    db.add(log)
+    db.commit()
+    db.refresh(log)
+    return log
+
+
+def sum_habit_for_day(db: Session, habit_id: int, day: dt.date) -> int:
+    rows = db.execute(select(HabitLog.value).where(and_(HabitLog.habit_id == habit_id, HabitLog.day == day))).all()
+    return sum(r[0] for r in rows)
 
 
 def add_checklist_items(db: Session, task_id: int, items: list[str]) -> list[TaskChecklist]:
