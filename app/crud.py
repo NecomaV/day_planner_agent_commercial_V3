@@ -11,10 +11,12 @@ from app.models.pantry import PantryItem
 from app.models.routine import RoutineConfig
 from app.models.routine_step import RoutineStep
 from app.models.task import Task
+from app.models.reminder import Reminder
 from app.models.user import User
 from app.models.workout import WorkoutPlan
 from app.schemas.routine import RoutinePatch
 from app.schemas.tasks import TaskCreate, TaskUpdate
+from app.security import api_key_prefix, generate_api_key, hash_api_key
 from app.settings import settings
 
 
@@ -43,6 +45,36 @@ def list_users(db: Session) -> list[User]:
 
 def get_user(db: Session, user_id: int) -> User | None:
     return db.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
+
+
+def get_user_by_api_key(db: Session, raw_key: str) -> User | None:
+    if not raw_key:
+        return None
+    key_hash = hash_api_key(raw_key)
+    return db.execute(select(User).where(User.api_key_hash == key_hash)).scalar_one_or_none()
+
+
+def ensure_user_api_key(db: Session, user_id: int) -> str:
+    user = get_user(db, user_id)
+    if not user:
+        raise ValueError("User not found")
+    if user.api_key_hash:
+        raise ValueError("User already has an API key; rotate instead")
+    return rotate_user_api_key(db, user_id)
+
+
+def rotate_user_api_key(db: Session, user_id: int) -> str:
+    user = get_user(db, user_id)
+    if not user:
+        raise ValueError("User not found")
+    raw_key = generate_api_key()
+    user.api_key_hash = hash_api_key(raw_key)
+    user.api_key_prefix = api_key_prefix(raw_key)
+    user.api_key_last_rotated_at = dt.datetime.utcnow()
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return raw_key
 
 
 def update_user_fields(db: Session, user_id: int, **fields) -> User | None:
@@ -401,13 +433,14 @@ def list_tasks_for_day(db: Session, user_id: int, day: dt.date) -> list[Task]:
     )
 
 
-def list_tasks_for_reminders(db: Session, now: dt.datetime, lead_minutes: int) -> list[Task]:
+def list_tasks_for_reminders(db: Session, user_id: int, now: dt.datetime, lead_minutes: int) -> list[Task]:
     end = now + dt.timedelta(minutes=lead_minutes)
     return list(
         db.execute(
             select(Task)
             .where(
                 and_(
+                    Task.user_id == user_id,
                     Task.is_done.is_(False),
                     Task.reminder_sent_at.is_(None),
                     or_(
@@ -436,7 +469,7 @@ def list_tasks_with_location(db: Session, user_id: int) -> list[Task]:
     )
 
 
-def list_late_tasks(db: Session, now: dt.datetime, grace_minutes: int) -> list[Task]:
+def list_late_tasks(db: Session, user_id: int, now: dt.datetime, grace_minutes: int) -> list[Task]:
     if grace_minutes < 0:
         grace_minutes = 0
     threshold = now - dt.timedelta(minutes=grace_minutes)
@@ -444,6 +477,7 @@ def list_late_tasks(db: Session, now: dt.datetime, grace_minutes: int) -> list[T
         db.execute(
             select(Task).where(
                 and_(
+                    Task.user_id == user_id,
                     Task.is_done.is_(False),
                     Task.planned_start.is_not(None),
                     Task.planned_start <= threshold,
@@ -801,3 +835,46 @@ def upsert_anchor(
     db.commit()
     db.refresh(task)
     return task
+
+
+
+def create_reminder(
+    db: Session,
+    user_id: int,
+    *,
+    due_at: dt.datetime,
+    channel: str,
+    payload_json: str,
+) -> Reminder:
+    reminder = Reminder(
+        user_id=user_id,
+        due_at=due_at,
+        channel=channel,
+        payload_json=payload_json,
+    )
+    db.add(reminder)
+    db.commit()
+    db.refresh(reminder)
+    return reminder
+
+
+def list_due_reminders(db: Session, now: dt.datetime, limit: int = 100) -> list[Reminder]:
+    stmt = (
+        select(Reminder)
+        .where(and_(Reminder.sent_at.is_(None), Reminder.due_at <= now))
+        .order_by(Reminder.due_at.asc(), Reminder.id.asc())
+        .limit(limit)
+    )
+    return list(db.execute(stmt).scalars())
+
+
+def mark_reminder_sent(db: Session, reminder: Reminder, sent_at: dt.datetime) -> None:
+    reminder.sent_at = sent_at
+    reminder.last_error = None
+    db.add(reminder)
+
+
+def record_reminder_failure(db: Session, reminder: Reminder, error: str) -> None:
+    reminder.attempts = int(reminder.attempts or 0) + 1
+    reminder.last_error = error[:400]
+    db.add(reminder)

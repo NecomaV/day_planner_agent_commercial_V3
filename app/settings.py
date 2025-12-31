@@ -20,6 +20,7 @@ class Settings(BaseSettings):
 
     # API
     API_KEY: str | None = None
+    API_KEY_SECRET: str | None = None
 
     # Reminders
     REMINDER_LEAD_MIN: int = 10

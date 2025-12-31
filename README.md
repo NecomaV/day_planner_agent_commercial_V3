@@ -31,7 +31,8 @@ cp .env.example .env
 ```
 
 - `TELEGRAM_BOT_TOKEN` is required for the bot.
-- `API_KEY` is optional. If set, the REST API requires `X-API-Key`.
+- `API_KEY` is optional. If set, the REST API requires `X-API-Key` in addition to user auth.
+- `API_KEY_SECRET` is required to hash per-user API tokens.
 - `REMINDER_LEAD_MIN` controls how many minutes before a task starts a reminder is sent.
 - `CALL_FOLLOWUP_DAYS` controls default follow-up delay for `/call`.
 - `OPENAI_API_KEY` enables optional voice transcription and AI intent parsing.
@@ -54,15 +55,32 @@ python run_local.py
 Open:
 - `http://127.0.0.1:8000/docs`
 
+API auth:
+- Use `Authorization: Bearer <api_token>` (get token via `/token` in Telegram).
+- If `API_KEY` is set, also send `X-API-Key`.
+
 ## 5) Run Telegram bot
 
 ```bash
 python run_telegram_bot.py
 ```
 
+## 6) Run reminders worker (optional)
+
+```bash
+python -m app.worker
+```
+
+## Docker (Postgres)
+
+```bash
+docker compose up --build
+```
+
 ### Bot commands
 - `/start` - help
-- `/me` - show user id
+- `/me` - show account info
+- `/token` - rotate API token for web/API access
 - `/todo <minutes> <text>` - create a backlog task
 - `/capture <text>` - quick task capture with date/time parsing
 - `/call <name> [notes]` - log a call and create follow-up

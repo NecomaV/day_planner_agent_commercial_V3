@@ -1,5 +1,9 @@
-from fastapi import Header, HTTPException
+from fastapi import Depends, Header, HTTPException
+from sqlalchemy.orm import Session
 
+from app import crud
+from app.models.user import User
+from app.db import get_db
 from app.settings import settings
 
 
@@ -8,13 +12,30 @@ def require_api_key(x_api_key: str | None = Header(default=None, alias="X-API-Ke
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def get_user_id(x_user_id: int | None = Header(default=None, alias="X-User-Id")) -> int:
-    if x_user_id is None:
-        raise HTTPException(status_code=401, detail="X-User-Id header is required")
+def _extract_bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    value = authorization.strip()
+    if not value.lower().startswith("bearer "):
+        return None
+    token = value.split(" ", 1)[1].strip()
+    return token or None
+
+
+def get_current_user(
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_user_key: str | None = Header(default=None, alias="X-User-Key"),
+) -> User:
+    token = _extract_bearer_token(authorization) or (x_user_key.strip() if x_user_key else None)
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing user API key")
     try:
-        user_id = int(x_user_id)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="X-User-Id must be an integer")
-    if user_id <= 0:
-        raise HTTPException(status_code=400, detail="X-User-Id must be positive")
-    return user_id
+        user = crud.get_user_by_api_key(db, token)
+    except RuntimeError:
+        raise HTTPException(status_code=500, detail="Server auth is not configured")
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid user API key")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="User is inactive")
+    return user

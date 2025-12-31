@@ -22,12 +22,12 @@
         </div>
         <div class="auth">
           <label>
-            ID пользователя
-            <input id="userId" type="number" placeholder="например 1" />
+            API токен
+            <input id="apiKey" type="password" placeholder="получите через /token в Telegram" />
           </label>
           <label>
-            API ключ
-            <input id="apiKey" type="password" placeholder="если задан" />
+            Сервисный ключ (опционально)
+            <input id="serviceKey" type="password" placeholder="если включена проверка X-API-Key" />
           </label>
           <button id="loadWeek">Загрузить неделю</button>
           <button id="themeToggle" class="ghost">Тема: темная</button>

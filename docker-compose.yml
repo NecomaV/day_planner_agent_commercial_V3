@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      APP_HOST: 0.0.0.0
+      DATABASE_URL: postgresql+psycopg://planner:planner@db:5432/planner
+    depends_on:
+      - db
+
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: planner
+      POSTGRES_PASSWORD: planner
+      POSTGRES_DB: planner
+    ports:
+      - "5432:5432"
+    volumes:
+      - planner_db:/var/lib/postgresql/data
+
+volumes:
+  planner_db:

@@ -4,7 +4,7 @@ import datetime as dt
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_user_id, require_api_key
+from app.api.deps import get_current_user, require_api_key
 from app.db import get_db
 from app.schemas.health import CheckinIn, CheckinOut
 from app import crud
@@ -13,11 +13,11 @@ router = APIRouter(prefix="/health", tags=["health"], dependencies=[Depends(requ
 
 
 @router.post("/checkin", response_model=CheckinOut)
-def upsert_checkin(payload: CheckinIn, db: Session = Depends(get_db), user_id: int = Depends(get_user_id)):
+def upsert_checkin(payload: CheckinIn, db: Session = Depends(get_db), user=Depends(get_current_user)):
     day = payload.day or dt.date.today()
     checkin = crud.upsert_daily_checkin(
         db,
-        user_id,
+        user.id,
         day,
         sleep_hours=payload.sleep_hours,
         energy_level=payload.energy_level,
@@ -28,6 +28,6 @@ def upsert_checkin(payload: CheckinIn, db: Session = Depends(get_db), user_id: i
 
 
 @router.get("/today", response_model=CheckinOut | None)
-def get_today(db: Session = Depends(get_db), user_id: int = Depends(get_user_id)):
+def get_today(db: Session = Depends(get_db), user=Depends(get_current_user)):
     day = dt.date.today()
-    return crud.get_daily_checkin(db, user_id, day)
+    return crud.get_daily_checkin(db, user.id, day)

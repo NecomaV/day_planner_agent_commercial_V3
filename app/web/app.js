@@ -1,7 +1,7 @@
 'use strict';
 
-const userIdInput = document.getElementById('userId');
 const apiKeyInput = document.getElementById('apiKey');
+const serviceKeyInput = document.getElementById('serviceKey');
 const loadWeekButton = document.getElementById('loadWeek');
 const prevWeekButton = document.getElementById('prevWeek');
 const nextWeekButton = document.getElementById('nextWeek');
@@ -262,19 +262,20 @@ function formatWeekLabel(days) {
 }
 
 function buildHeaders() {
-  const userId = userIdInput.value.trim();
-  if (!userId) {
-    throw new Error('Нужен user_id.');
+  const userToken = apiKeyInput.value.trim();
+  if (!userToken) {
+    throw new Error('Enter API token.');
   }
   const headers = {
-    'X-User-Id': userId,
+    Authorization: `Bearer ${userToken}`,
   };
-  const apiKey = apiKeyInput.value.trim();
-  if (apiKey) {
-    headers['X-API-Key'] = apiKey;
+  const serviceKey = serviceKeyInput.value.trim();
+  if (serviceKey) {
+    headers['X-API-Key'] = serviceKey;
   }
   return headers;
 }
+
 
 async function fetchJson(url, headers) {
   const response = await fetch(url, { headers });
@@ -728,8 +729,8 @@ function restoreSelection() {
 function saveAuth() {
   try {
     const payload = {
-      userId: userIdInput.value.trim(),
       apiKey: apiKeyInput.value.trim(),
+      serviceKey: serviceKeyInput.value.trim(),
     };
     localStorage.setItem('dpCabinetAuth', JSON.stringify(payload));
   } catch (err) {
@@ -737,17 +738,19 @@ function saveAuth() {
   }
 }
 
+
 function loadAuth() {
   try {
     const raw = localStorage.getItem('dpCabinetAuth');
     if (!raw) return;
     const payload = JSON.parse(raw);
-    if (payload.userId) userIdInput.value = payload.userId;
     if (payload.apiKey) apiKeyInput.value = payload.apiKey;
+    if (payload.serviceKey) serviceKeyInput.value = payload.serviceKey;
   } catch (err) {
     // ignore storage errors
   }
 }
+
 
 async function patchTask(taskId, payload) {
   const headers = buildHeaders();
