@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 
 from app import crud
 from app.db import SessionLocal
+from app.i18n.core import locale_for_user, t
 
 
 @contextmanager
@@ -35,9 +36,8 @@ async def get_user(update: Update, db):
 async def get_active_user(update: Update, context: ContextTypes.DEFAULT_TYPE, db):
     user = await get_user(update, db)
     if not user.is_active:
-        await update.message.reply_text(
-            "Вы вышли. Используйте /login для активации."
-        )
+        locale = locale_for_user(user)
+        await update.message.reply_text(t("auth.inactive", locale=locale))
         return None
     return user
 
@@ -53,7 +53,8 @@ async def get_ready_user(
     if not user:
         return None
     if not user.onboarded:
-        await update.message.reply_text("Сначала пройдем настройку.")
+        locale = locale_for_user(user)
+        await update.message.reply_text(t("onboarding.required", locale=locale))
         if start_onboarding is not None:
             await start_onboarding(update, context)
         return None

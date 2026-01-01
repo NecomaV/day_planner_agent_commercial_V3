@@ -28,6 +28,7 @@ class User(Base):
     api_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     api_key_prefix: Mapped[str | None] = mapped_column(String(12), nullable=True)
     api_key_last_rotated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    api_key_last_used_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=lambda: dt.datetime.utcnow())
 
@@ -40,3 +41,4 @@ class User(Base):
     habits = relationship("Habit", back_populates="user", cascade="all, delete-orphan")
     habit_logs = relationship("HabitLog", back_populates="user", cascade="all, delete-orphan")
     reminders = relationship("Reminder", back_populates="user", cascade="all, delete-orphan")
+    usage_counters = relationship("UsageCounter", back_populates="user", cascade="all, delete-orphan")

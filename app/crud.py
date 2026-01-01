@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 
 from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
@@ -14,6 +15,7 @@ from app.models.task import Task
 from app.models.reminder import Reminder
 from app.models.user import User
 from app.models.workout import WorkoutPlan
+from app.models.usage import UsageCounter
 from app.schemas.routine import RoutinePatch
 from app.schemas.tasks import TaskCreate, TaskUpdate
 from app.security import api_key_prefix, generate_api_key, hash_api_key
@@ -50,8 +52,15 @@ def get_user(db: Session, user_id: int) -> User | None:
 def get_user_by_api_key(db: Session, raw_key: str) -> User | None:
     if not raw_key:
         return None
+    prefix = api_key_prefix(raw_key)
+    candidates = list(db.execute(select(User).where(User.api_key_prefix == prefix)).scalars())
+    if not candidates:
+        return None
     key_hash = hash_api_key(raw_key)
-    return db.execute(select(User).where(User.api_key_hash == key_hash)).scalar_one_or_none()
+    for user in candidates:
+        if user.api_key_hash and hmac.compare_digest(user.api_key_hash, key_hash):
+            return user
+    return None
 
 
 def ensure_user_api_key(db: Session, user_id: int) -> str:
@@ -71,10 +80,20 @@ def rotate_user_api_key(db: Session, user_id: int) -> str:
     user.api_key_hash = hash_api_key(raw_key)
     user.api_key_prefix = api_key_prefix(raw_key)
     user.api_key_last_rotated_at = dt.datetime.utcnow()
+    user.api_key_last_used_at = None
     db.add(user)
     db.commit()
     db.refresh(user)
     return raw_key
+
+
+def touch_user_api_key(db: Session, user_id: int) -> None:
+    user = get_user(db, user_id)
+    if not user:
+        return
+    user.api_key_last_used_at = dt.datetime.utcnow()
+    db.add(user)
+    db.commit()
 
 
 def update_user_fields(db: Session, user_id: int, **fields) -> User | None:
@@ -878,3 +897,38 @@ def record_reminder_failure(db: Session, reminder: Reminder, error: str) -> None
     reminder.attempts = int(reminder.attempts or 0) + 1
     reminder.last_error = error[:400]
     db.add(reminder)
+
+
+def get_usage_counter(db: Session, user_id: int, day: dt.date) -> UsageCounter | None:
+    return db.execute(
+        select(UsageCounter).where(and_(UsageCounter.user_id == user_id, UsageCounter.day == day))
+    ).scalar_one_or_none()
+
+
+def get_or_create_usage_counter(db: Session, user_id: int, day: dt.date) -> UsageCounter:
+    counter = get_usage_counter(db, user_id, day)
+    if counter:
+        return counter
+    counter = UsageCounter(user_id=user_id, day=day, ai_requests=0, transcribe_seconds=0)
+    db.add(counter)
+    db.commit()
+    db.refresh(counter)
+    return counter
+
+
+def increment_ai_requests(db: Session, user_id: int, day: dt.date, amount: int = 1) -> UsageCounter:
+    counter = get_or_create_usage_counter(db, user_id, day)
+    counter.ai_requests = int(counter.ai_requests or 0) + amount
+    db.add(counter)
+    db.commit()
+    db.refresh(counter)
+    return counter
+
+
+def increment_transcribe_seconds(db: Session, user_id: int, day: dt.date, seconds: int) -> UsageCounter:
+    counter = get_or_create_usage_counter(db, user_id, day)
+    counter.transcribe_seconds = int(counter.transcribe_seconds or 0) + seconds
+    db.add(counter)
+    db.commit()
+    db.refresh(counter)
+    return counter

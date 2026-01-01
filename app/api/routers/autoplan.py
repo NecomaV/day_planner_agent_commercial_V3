@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app import crud
 from app.db import get_db
-from app.api.deps import get_current_user, require_api_key
+from app.api.deps import get_current_user_ai, require_api_key
 from app.services.autoplan import autoplan_days
 
 router = APIRouter(prefix="/autoplan", tags=["autoplan"], dependencies=[Depends(require_api_key)])
@@ -17,7 +17,7 @@ def run_autoplan(
     days: int = Query(1, ge=1, le=14),
     start_date: dt.date | None = Query(None, description="YYYY-MM-DD; default=today"),
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_ai),
 ):
     start = start_date or dt.date.today()
     routine = crud.get_routine(db, user.id)

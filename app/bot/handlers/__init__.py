@@ -1,7 +1,9 @@
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
+from app.bot.middleware.throttle import wrap_throttled
 from app.bot.handlers.core import (
     cmd_cabinet,
+    cmd_lang,
     cmd_login,
     cmd_logout,
     cmd_me,
@@ -32,38 +34,39 @@ from app.bot.jobs import reminder_job
 
 
 def register_handlers(app: Application) -> None:
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("me", cmd_me))
-    app.add_handler(CommandHandler("token", cmd_token))
-    app.add_handler(CommandHandler("todo", cmd_todo))
-    app.add_handler(CommandHandler("capture", cmd_capture))
-    app.add_handler(CommandHandler("call", cmd_call))
-    app.add_handler(CommandHandler("plan", cmd_plan))
-    app.add_handler(CommandHandler("autoplan", cmd_autoplan))
-    app.add_handler(CommandHandler("morning", cmd_morning))
-    app.add_handler(CommandHandler("routine_add", cmd_routine_add))
-    app.add_handler(CommandHandler("routine_list", cmd_routine_list))
-    app.add_handler(CommandHandler("routine_del", cmd_routine_del))
-    app.add_handler(CommandHandler("pantry", cmd_pantry))
-    app.add_handler(CommandHandler("breakfast", cmd_breakfast))
-    app.add_handler(CommandHandler("health", cmd_health))
-    app.add_handler(CommandHandler("habit", cmd_habit))
-    app.add_handler(CommandHandler("workout", cmd_workout))
-    app.add_handler(CommandHandler("task_location", cmd_task_location))
-    app.add_handler(CommandHandler("delay", cmd_delay))
-    app.add_handler(CommandHandler("cabinet", cmd_cabinet))
-    app.add_handler(CommandHandler("setup", cmd_setup))
-    app.add_handler(CommandHandler("login", cmd_login))
-    app.add_handler(CommandHandler("logout", cmd_logout))
-    app.add_handler(CommandHandler("done", cmd_done))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("unschedule", cmd_unschedule))
-    app.add_handler(CommandHandler("slots", cmd_slots))
-    app.add_handler(CommandHandler("place", cmd_place))
-    app.add_handler(CommandHandler("schedule", cmd_schedule))
+    app.add_handler(CommandHandler("start", wrap_throttled(cmd_start)))
+    app.add_handler(CommandHandler("me", wrap_throttled(cmd_me)))
+    app.add_handler(CommandHandler("token", wrap_throttled(cmd_token)))
+    app.add_handler(CommandHandler("todo", wrap_throttled(cmd_todo)))
+    app.add_handler(CommandHandler("capture", wrap_throttled(cmd_capture)))
+    app.add_handler(CommandHandler("call", wrap_throttled(cmd_call, heavy=True)))
+    app.add_handler(CommandHandler("plan", wrap_throttled(cmd_plan, heavy=True)))
+    app.add_handler(CommandHandler("autoplan", wrap_throttled(cmd_autoplan, heavy=True)))
+    app.add_handler(CommandHandler("morning", wrap_throttled(cmd_morning)))
+    app.add_handler(CommandHandler("routine_add", wrap_throttled(cmd_routine_add)))
+    app.add_handler(CommandHandler("routine_list", wrap_throttled(cmd_routine_list)))
+    app.add_handler(CommandHandler("routine_del", wrap_throttled(cmd_routine_del)))
+    app.add_handler(CommandHandler("pantry", wrap_throttled(cmd_pantry)))
+    app.add_handler(CommandHandler("breakfast", wrap_throttled(cmd_breakfast)))
+    app.add_handler(CommandHandler("health", wrap_throttled(cmd_health)))
+    app.add_handler(CommandHandler("habit", wrap_throttled(cmd_habit)))
+    app.add_handler(CommandHandler("workout", wrap_throttled(cmd_workout)))
+    app.add_handler(CommandHandler("task_location", wrap_throttled(cmd_task_location)))
+    app.add_handler(CommandHandler("delay", wrap_throttled(cmd_delay)))
+    app.add_handler(CommandHandler("cabinet", wrap_throttled(cmd_cabinet)))
+    app.add_handler(CommandHandler("setup", wrap_throttled(cmd_setup)))
+    app.add_handler(CommandHandler("login", wrap_throttled(cmd_login)))
+    app.add_handler(CommandHandler("logout", wrap_throttled(cmd_logout)))
+    app.add_handler(CommandHandler("lang", wrap_throttled(cmd_lang)))
+    app.add_handler(CommandHandler("done", wrap_throttled(cmd_done)))
+    app.add_handler(CommandHandler("delete", wrap_throttled(cmd_delete)))
+    app.add_handler(CommandHandler("unschedule", wrap_throttled(cmd_unschedule)))
+    app.add_handler(CommandHandler("slots", wrap_throttled(cmd_slots)))
+    app.add_handler(CommandHandler("place", wrap_throttled(cmd_place)))
+    app.add_handler(CommandHandler("schedule", wrap_throttled(cmd_schedule)))
 
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
-    app.add_handler(MessageHandler(filters.LOCATION, handle_location_message))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    app.add_handler(MessageHandler(filters.VOICE, wrap_throttled(handle_voice_message, heavy=True, dedupe=False)))
+    app.add_handler(MessageHandler(filters.LOCATION, wrap_throttled(handle_location_message, dedupe=False)))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, wrap_throttled(handle_text_message)))
 
     app.job_queue.run_repeating(reminder_job, interval=60, first=15)

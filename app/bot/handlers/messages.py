@@ -1,3 +1,4 @@
+﻿
 from __future__ import annotations
 
 import datetime as dt
@@ -42,17 +43,35 @@ from app.bot.handlers.tasks import (
     handle_task_request as _handle_task_request,
     prompt_task_selection as _prompt_task_selection,
 )
-from app.bot.parsing.commands import parse_command_text as _parse_command_text, parse_yes_no as _parse_yes_no
-from app.bot.parsing.text import extract_task_ids as _extract_task_ids, split_items as _split_items
+from app.bot.parsing.commands import parse_command_text as _parse_command_text
+from app.bot.parsing.ru_reply import parse_reply
+from app.bot.parsing.text import (
+    extract_routine_items as _extract_routine_items,
+    extract_task_ids as _extract_task_ids,
+    split_items as _split_items,
+)
 from app.bot.parsing.time import (
     DATE_TOKEN_RE,
+    MONTH_RE,
     RUS_WEEKDAY_MAP,
     _detect_relative_day,
     _extract_dates_from_text,
     _format_date_list,
 )
+from app.bot.rendering.keyboard import yes_no_cancel_keyboard, yes_no_keyboard
 from app.bot.rendering.tasks import render_day_plan as _render_day_plan
+from app.bot.throttle import throttle
 from app.bot.utils import now_local_naive as _now_local_naive
+from app.i18n.core import locale_for_user, t
+from app.services.ai_guard import (
+    breaker as _breaker,
+    check_ai_quota,
+    check_audio_limits,
+    check_text_limit,
+    check_transcribe_quota,
+    record_ai_request,
+    record_transcribe_seconds,
+)
 from app.services.ai_chat import chat_reply
 from app.services.ai_intent import parse_intent
 from app.services.ai_transcribe import transcribe_audio
@@ -61,6 +80,36 @@ from app.services.meal_suggest import suggest_meals
 from app.services.quick_capture import parse_quick_task
 from app.settings import settings
 
+
+HEAVY_COMMANDS = {"plan", "autoplan", "call"}
+
+
+def _idempotency_key(update: Update) -> str | None:
+    if not update.message or not update.effective_chat:
+        return None
+    return f"tg:{update.effective_chat.id}:{update.message.message_id}"
+
+
+def _user_key(user) -> str:
+    return str(getattr(user, "id", None) or getattr(user, "telegram_chat_id", ""))
+
+
+async def _acquire_heavy_lock(user, update: Update, *, text: str | None, locale: str):
+    decision = throttle().check(_user_key(user), text=text, heavy=True)
+    if not decision.allowed:
+        if not decision.deduped:
+            reason_key = decision.reason or "bot.throttle.cooldown"
+            await update.message.reply_text(
+                t(reason_key, locale=locale, retry_after=decision.retry_after),
+                reply_markup=yes_no_cancel_keyboard(locale),
+            )
+        return None
+    lock = throttle().get_lock(_user_key(user))
+    if lock.locked():
+        await update.message.reply_text(t("bot.throttle.busy", locale=locale))
+        return None
+    await lock.acquire()
+    return lock
 
 
 def _extract_person_name(text: str) -> str | None:
@@ -80,7 +129,6 @@ def _detect_suggestion(text: str) -> dict | None:
         return {"type": "prep", "raw": text}
     return None
 
-
 async def _handle_pending_suggestion(
     text: str,
     update: Update,
@@ -91,24 +139,37 @@ async def _handle_pending_suggestion(
     pending = context.user_data.get("pending_suggestion")
     if not pending:
         return False
-    answer = _parse_yes_no(text)
+    locale = locale_for_user(user)
+    flags = parse_reply(text)
+    if flags.is_cancel:
+        context.user_data.pop("pending_suggestion", None)
+        await update.message.reply_text(t("suggestion.cancelled", locale=locale))
+        return True
+    answer = None
+    if flags.is_yes and not flags.is_no:
+        answer = True
+    elif flags.is_no and not flags.is_yes:
+        answer = False
     if answer is None:
-        await update.message.reply_text("Ответьте «да» или «нет».")
+        await update.message.reply_text(
+            t("common.reply_yes_no", locale=locale),
+            reply_markup=yes_no_keyboard(locale),
+        )
         return True
     context.user_data.pop("pending_suggestion", None)
     if not answer:
-        await update.message.reply_text("Ок, без задачи.")
+        await update.message.reply_text(t("suggestion.skip", locale=locale))
         return True
 
     now = _now_local_naive()
     if pending.get("type") == "followup":
-        name = pending.get("name") or "контакту"
+        name = pending.get("name") or t("suggestion.followup.default_name", locale=locale)
         due_day = now.date() + dt.timedelta(days=max(0, settings.CALL_FOLLOWUP_DAYS))
         due_at = dt.datetime.combine(due_day, dt.time(9, 0))
         task = crud.create_task_fields(
             db,
             user.id,
-            title=f"Фоллоу-ап по {name}",
+            title=t("suggestion.followup.title", locale=locale, name=name),
             notes=None,
             due_at=due_at,
             priority=2,
@@ -117,8 +178,14 @@ async def _handle_pending_suggestion(
             schedule_source="assistant",
             idempotency_key=None,
         )
-        crud.add_checklist_items(db, task.id, [f"Отправить резюме {name}"])
-        await update.message.reply_text(f"Создан фоллоу-ап (id={task.id}).")
+        crud.add_checklist_items(
+            db,
+            task.id,
+            [t("suggestion.followup.checklist", locale=locale, name=name)],
+        )
+        await update.message.reply_text(
+            t("suggestion.followup.created", locale=locale, task_id=task.id)
+        )
         return True
 
     if pending.get("type") == "prep":
@@ -134,7 +201,7 @@ async def _handle_pending_suggestion(
         task = crud.create_task_fields(
             db,
             user.id,
-            title="Подготовиться к встрече",
+            title=t("suggestion.prep.title", locale=locale),
             notes=None,
             due_at=due_at,
             priority=2,
@@ -143,7 +210,9 @@ async def _handle_pending_suggestion(
             schedule_source="assistant",
             idempotency_key=None,
         )
-        await update.message.reply_text(f"Создана задача подготовки (id={task.id}).")
+        await update.message.reply_text(
+            t("suggestion.prep.created", locale=locale, task_id=task.id)
+        )
         return True
 
     return True
@@ -183,7 +252,7 @@ def _parse_clear_targets(text: str) -> list[str]:
     targets = []
     if any(word in lower for word in ["задач", "task", "tasks"]):
         targets.append("tasks")
-    if any(word in lower for word in ["рутин", "routine", "routine", "утрен"]):
+    if any(word in lower for word in ["рутин", "routine", "утрен"]):
         targets.append("routine")
     return targets
 
@@ -225,17 +294,17 @@ def _append_chat_history(context: ContextTypes.DEFAULT_TYPE, role: str, content:
     context.user_data["chat_history"] = history[-limit:]
 
 
-def _format_clear_targets(targets: list[str]) -> str:
+def _format_clear_targets(targets: list[str], locale: str) -> str:
     parts = []
     if "tasks" in targets:
-        parts.append("все задачи")
+        parts.append(t("clear_all.targets.tasks", locale=locale))
     if "routine" in targets:
-        parts.append("все шаги рутины")
+        parts.append(t("clear_all.targets.routine", locale=locale))
     if len(parts) == 2:
-        return f"{parts[0]} и {parts[1]}"
+        return t("clear_all.targets.both", locale=locale, first=parts[0], second=parts[1])
     if parts:
         return parts[0]
-    return "все данные"
+    return t("clear_all.targets.all", locale=locale)
 
 
 def _build_assistant_context(db, user) -> str:
@@ -247,34 +316,33 @@ def _build_assistant_context(db, user) -> str:
     backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
     scheduled.sort(key=lambda t: t.planned_start)
 
-    display_name = user.full_name or "пользователь"
+    display_name = user.full_name or "user"
     lines = [
-        f"Пользователь: {display_name}",
-        f"Фокус: {user.primary_focus or 'не задан'}",
-        f"Дата и время: {now.strftime('%Y-%m-%d %H:%M')} ({user.timezone or settings.TZ})",
-        f"Цели сна: подъем {routine.sleep_target_wakeup}, сон {routine.sleep_target_bedtime}",
-        f"Рабочий день: {routine.workday_start}-{routine.workday_end}",
-        f"Ограничение по времени: {routine.latest_task_end or 'нет'}",
-        f"Буфер между задачами: {routine.task_buffer_after_min} мин",
-        f"Запланировано на сегодня: {len(scheduled)}",
+        f"User: {display_name}",
+        f"Focus: {user.primary_focus or 'not set'}",
+        f"Now: {now.strftime('%Y-%m-%d %H:%M')} ({user.timezone or settings.TZ})",
+        f"Sleep targets: wake {routine.sleep_target_wakeup}, bed {routine.sleep_target_bedtime}",
+        f"Workday: {routine.workday_start}-{routine.workday_end}",
+        f"Latest task end: {routine.latest_task_end or 'none'}",
+        f"Task buffer: {routine.task_buffer_after_min} min",
+        f"Scheduled today: {len(scheduled)}",
     ]
     if scheduled:
-        lines.append("Ближайшие задачи:")
+        lines.append("Upcoming tasks:")
         for t in scheduled[:5]:
             when = t.planned_start.strftime("%H:%M")
             lines.append(f"- {when} {t.title} (id={t.id})")
-    lines.append(f"Бэклог: {len(backlog)}")
+    lines.append(f"Backlog: {len(backlog)}")
     return "\n".join(lines)
 
 
-def _assistant_system_prompt() -> str:
+def _assistant_system_prompt(locale: str) -> str:
+    language = "Russian" if locale.startswith("ru") else "English"
     return (
-        "Ты - русскоязычный ИИ-ассистент для бизнеса (в стиле Джарвис), "
-        "помогаешь планировать день, отвечаешь на вопросы, предлагаешь идеи и уточнения. "
-        "Будь кратким, дружелюбным и практичным. "
-        "Если для ответа нужна дополнительная информация, задай уточняющий вопрос. "
-        "Не создавай задачи сам - предложи пользователю сказать: <создай задачу ...>, "
-        "если это уместно."
+        "You are a professional business assistant. "
+        "Answer user questions, offer concise suggestions, and ask for clarification when needed. "
+        "Do not create tasks automatically; if a task is needed, suggest the user to say: <create task ...>. "
+        f"Respond in {language}."
     )
 
 
@@ -292,7 +360,10 @@ def _detect_day_from_text(text: str, now: dt.datetime) -> dt.date:
             return dt.date.fromisoformat(m.group(1))
         except ValueError:
             pass
-    m = re.search(r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b", lower)
+    m = re.search(
+        r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b",
+        lower,
+    )
     if m:
         token = m.group(2)
         target = RUS_WEEKDAY_MAP.get(token, now.weekday())
@@ -375,19 +446,42 @@ async def _run_command_by_name(
     return True
 
 
+async def _run_command_with_throttle(
+    name: str,
+    args: list[str],
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user,
+) -> bool:
+    if name not in HEAVY_COMMANDS:
+        return await _run_command_by_name(name, args, update, context)
+
+    locale = locale_for_user(user)
+    lock = await _acquire_heavy_lock(user, update, text=" ".join(args) or None, locale=locale)
+    if not lock:
+        return True
+    try:
+        return await _run_command_by_name(name, args, update, context)
+    finally:
+        lock.release()
+
+
 async def _prompt_clear_all(
     targets: list[str],
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
+    *,
+    locale: str,
 ) -> None:
     if not targets:
-        await update.message.reply_text(
-            "Что удалить? Напишите, например: удалить все задачи, удалить все шаги рутины."
-        )
+        await update.message.reply_text(t("clear_all.usage", locale=locale))
         return
     context.user_data["pending_clear"] = {"targets": targets}
-    message = _format_clear_targets(targets)
-    await update.message.reply_text(f"Подтвердите: удалить {message}? (да/нет)")
+    message = _format_clear_targets(targets, locale)
+    await update.message.reply_text(
+        t("clear_all.confirm", locale=locale, targets=message),
+        reply_markup=yes_no_keyboard(locale),
+    )
 
 
 async def _handle_pending_clear(
@@ -400,13 +494,26 @@ async def _handle_pending_clear(
     pending = context.user_data.get("pending_clear")
     if not pending:
         return False
-    answer = _parse_yes_no(text)
+    locale = locale_for_user(user)
+    flags = parse_reply(text)
+    if flags.is_cancel:
+        context.user_data.pop("pending_clear", None)
+        await update.message.reply_text(t("clear_all.cancelled", locale=locale))
+        return True
+    answer = None
+    if flags.is_yes and not flags.is_no:
+        answer = True
+    elif flags.is_no and not flags.is_yes:
+        answer = False
     if answer is None:
-        await update.message.reply_text("Ответьте <да> или <нет>.")
+        await update.message.reply_text(
+            t("common.reply_yes_no", locale=locale),
+            reply_markup=yes_no_cancel_keyboard(locale),
+        )
         return True
     context.user_data.pop("pending_clear", None)
     if not answer:
-        await update.message.reply_text("Ок, ничего не удаляю.")
+        await update.message.reply_text(t("clear_all.cancelled", locale=locale))
         return True
 
     targets = pending.get("targets") or []
@@ -417,7 +524,7 @@ async def _handle_pending_clear(
     if "routine" in targets:
         count_steps = crud.delete_all_routine_steps(db, user.id)
     await update.message.reply_text(
-        f"Готово. Удалено задач: {count_tasks}, шагов рутины: {count_steps}."
+        t("clear_all.done", locale=locale, tasks=count_tasks, steps=count_steps)
     )
     return True
 
@@ -429,6 +536,8 @@ async def _handle_ai_intent(
     context: ContextTypes.DEFAULT_TYPE,
     db,
     user,
+    *,
+    locale: str,
 ) -> bool:
     intent = (data.get("intent") or "").lower()
     if intent == "routine":
@@ -452,7 +561,9 @@ async def _handle_ai_intent(
             )
             position += 1
             offset += 10
-        await update.message.reply_text(f"Добавлено шагов рутины: {len(items)}. Используйте /morning для просмотра.")
+        await update.message.reply_text(
+            t("routine.added.bulk", locale=locale, count=len(items))
+        )
         return True
 
     if intent in {"pantry_add", "pantry_remove"}:
@@ -468,13 +579,13 @@ async def _handle_ai_intent(
                 qty = item.get("quantity")
                 if name:
                     crud.upsert_pantry_item(db, user.id, name=name, quantity=qty)
-            await update.message.reply_text("Продукты обновлены.")
+            await update.message.reply_text(t("pantry.updated", locale=locale))
             return True
         for item in items:
             name = str(item.get("name", "")).strip()
             if name:
                 crud.remove_pantry_item(db, user.id, name=name)
-        await update.message.reply_text("Продукты обновлены.")
+        await update.message.reply_text(t("pantry.updated", locale=locale))
         return True
 
     if intent == "workout_set":
@@ -490,7 +601,9 @@ async def _handle_ai_intent(
         if weekday_int < 0 or weekday_int > 6:
             return False
         crud.set_workout_plan(db, user.id, weekday_int, title=title, details=details)
-        await update.message.reply_text(f"План тренировки сохранен для дня {weekday_int}: {title}")
+        await update.message.reply_text(
+            t("workout.set.saved", locale=locale, weekday=weekday_int, title=title)
+        )
         return True
 
     if intent == "breakfast":
@@ -498,18 +611,27 @@ async def _handle_ai_intent(
         pantry_names = [i.name for i in items]
         suggestions = suggest_meals(pantry_names, meal="breakfast", limit=3)
         if not pantry_names:
-            await update.message.reply_text("В кладовой пусто. Добавьте продукты через /pantry add <продукт>.")
+            await update.message.reply_text(t("pantry.empty", locale=locale))
             return True
         if not suggestions:
-            await update.message.reply_text("Нет подходящих рецептов. Добавьте больше продуктов.")
+            await update.message.reply_text(t("pantry.breakfast.none", locale=locale))
             return True
-        lines = ["Идеи для завтрака:"]
+        lines = [t("pantry.breakfast.header", locale=locale)]
         for s in suggestions:
             if s["missing"]:
                 missing = ", ".join(s["missing"])
-                lines.append(f"- {s['name']} (не хватает: {missing})")
+                lines.append(
+                    t(
+                        "pantry.breakfast.item_missing",
+                        locale=locale,
+                        name=s["name"],
+                        missing=missing,
+                    )
+                )
             else:
-                lines.append(f"- {s['name']} (все есть)")
+                lines.append(
+                    t("pantry.breakfast.item_ready", locale=locale, name=s["name"])
+                )
         await update.message.reply_text("\n".join(lines))
         return True
 
@@ -520,7 +642,7 @@ async def _handle_ai_intent(
         tasks = crud.list_tasks_for_day(db, user.id, day)
         scheduled = [t for t in tasks if t.planned_start and not t.is_done]
         backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
-        await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine))
+        await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine, locale=locale))
         return True
 
     if intent == "clear_all":
@@ -536,7 +658,7 @@ async def _handle_ai_intent(
                 targets.append("routine")
         if not targets:
             targets = _parse_clear_targets(original_text)
-        await _prompt_clear_all(targets, update, context)
+        await _prompt_clear_all(targets, update, context, locale=locale)
         return True
 
     if intent == "command":
@@ -555,7 +677,7 @@ async def _handle_ai_intent(
             if ids:
                 await _apply_task_actions(name, ids, update, db, user)
                 return True
-        return await _run_command_by_name(name, [str(a) for a in args], update, context)
+        return await _run_command_with_throttle(name, [str(a) for a in args], update, context, user)
 
     if intent == "task":
         task_text = data.get("text") or original_text
@@ -582,6 +704,7 @@ async def _process_user_text(
     user,
 ) -> None:
     routine = crud.get_routine(db, user.id)
+    locale = locale_for_user(user)
     ai_enabled = bool(settings.OPENAI_API_KEY)
 
     if await _handle_pending_conflict(text, update, context, db, user, routine):
@@ -613,12 +736,12 @@ async def _process_user_text(
             if ids:
                 await _apply_task_actions(name, ids, update, db, user)
                 return
-        handled = await _run_command_by_name(name, args, update, context)
+        handled = await _run_command_with_throttle(name, args, update, context, user)
         if handled:
             return
 
     if _looks_like_greeting(text):
-        await update.message.reply_text("Привет! Чем помочь?")
+        await update.message.reply_text(t("chat.greeting", locale=locale))
         return
 
     if _looks_like_delete_by_date(text, _now_local_naive()):
@@ -629,34 +752,35 @@ async def _process_user_text(
             if relative:
                 dates = [relative]
         if not dates:
-            await update.message.reply_text("Не понял даты. Пример: удали задачи 30 и 31 декабря.")
+            await update.message.reply_text(t("delete_by_date.invalid", locale=locale))
             return
         count = crud.delete_tasks_by_dates(db, user.id, dates)
         dates_text = _format_date_list(dates)
-        await update.message.reply_text(f"Удалено задач на даты: {dates_text}. Всего: {count}.")
+        await update.message.reply_text(
+            t("delete_by_date.done", locale=locale, dates=dates_text, count=count)
+        )
         return
 
     if _looks_like_clear_all(text):
         targets = _parse_clear_targets(text)
-        await _prompt_clear_all(targets, update, context)
+        await _prompt_clear_all(targets, update, context, locale=locale)
         return
 
     suggestion = _detect_suggestion(text)
     if suggestion and not _should_create_task(text):
         context.user_data["pending_suggestion"] = suggestion
         if suggestion["type"] == "followup":
-            await update.message.reply_text("Создать фоллоу-ап по звонку? (да/нет)")
+            await update.message.reply_text(
+                t("suggestion.followup.ask", locale=locale),
+                reply_markup=yes_no_keyboard(locale),
+            )
             return
         if suggestion["type"] == "prep":
-            await update.message.reply_text("Создать задачу подготовки к встрече? (да/нет)")
+            await update.message.reply_text(
+                t("suggestion.prep.ask", locale=locale),
+                reply_markup=yes_no_keyboard(locale),
+            )
             return
-
-    if ai_enabled:
-        data = parse_intent(text, settings.OPENAI_API_KEY, settings.OPENAI_CHAT_MODEL)
-        if data:
-            handled = await _handle_ai_intent(data, text, update, context, db, user)
-            if handled:
-                return
 
     lower = text.lower()
     if any(word in lower for word in ["удали", "удалить", "delete", "стереть", "убери задачу"]):
@@ -685,16 +809,22 @@ async def _process_user_text(
 
     if _is_autoplan_request(text):
         args = _parse_autoplan_args(text)
-        await _run_command_by_name("autoplan", args, update, context)
+        await _run_command_with_throttle("autoplan", args, update, context, user)
         return
 
     if _is_plan_request(text):
-        day = _detect_day_from_text(text, _now_local_naive())
-        ensure_day_anchors(db, user.id, day, routine)
-        tasks = crud.list_tasks_for_day(db, user.id, day)
-        scheduled = [t for t in tasks if t.planned_start and not t.is_done]
-        backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
-        await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine))
+        lock = await _acquire_heavy_lock(user, update, text=text, locale=locale)
+        if not lock:
+            return
+        try:
+            day = _detect_day_from_text(text, _now_local_naive())
+            ensure_day_anchors(db, user.id, day, routine)
+            tasks = crud.list_tasks_for_day(db, user.id, day)
+            scheduled = [t for t in tasks if t.planned_start and not t.is_done]
+            backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
+            await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine, locale=locale))
+        finally:
+            lock.release()
         return
 
     if _is_breakfast_request(text):
@@ -702,18 +832,25 @@ async def _process_user_text(
         pantry_names = [i.name for i in items]
         suggestions = suggest_meals(pantry_names, meal="breakfast", limit=3)
         if not pantry_names:
-            await update.message.reply_text("В кладовой пусто. Добавьте продукты через /pantry add <продукт>.")
+            await update.message.reply_text(t("pantry.empty", locale=locale))
             return
         if not suggestions:
-            await update.message.reply_text("Нет подходящих рецептов. Добавьте больше продуктов.")
+            await update.message.reply_text(t("pantry.breakfast.none", locale=locale))
             return
-        lines = ["Идеи для завтрака:"]
+        lines = [t("pantry.breakfast.header", locale=locale)]
         for s in suggestions:
             if s["missing"]:
                 missing = ", ".join(s["missing"])
-                lines.append(f"- {s['name']} (не хватает: {missing})")
+                lines.append(
+                    t(
+                        "pantry.breakfast.item_missing",
+                        locale=locale,
+                        name=s["name"],
+                        missing=missing,
+                    )
+                )
             else:
-                lines.append(f"- {s['name']} (все есть)")
+                lines.append(t("pantry.breakfast.item_ready", locale=locale, name=s["name"]))
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -735,30 +872,86 @@ async def _process_user_text(
             position += 1
             offset += 10
 
-        await update.message.reply_text(f"Добавлено шагов: {len(items)}. Используйте /morning для просмотра.")
+        await update.message.reply_text(
+            t("routine.added.bulk", locale=locale, count=len(items))
+        )
         return
 
-    if not _should_create_task(text):
+    ai_lock = None
+    try:
         if ai_enabled:
-            context_prompt = _build_assistant_context(db, user)
-            history = _get_chat_history(context)
-            reply = chat_reply(
-                text,
-                settings.OPENAI_API_KEY,
-                settings.OPENAI_CHAT_MODEL,
-                system_prompt=_assistant_system_prompt(),
-                context_prompt=context_prompt,
-                history=history,
-            )
-            if reply:
-                _append_chat_history(context, "user", text)
-                _append_chat_history(context, "assistant", reply)
-                await update.message.reply_text(reply)
+            guard = check_text_limit(text)
+            if not guard.allowed:
+                await update.message.reply_text(t(guard.reason, locale=locale))
                 return
-            await update.message.reply_text("Не удалось получить ответ от ИИ. Попробуйте еще раз.")
+            guard = check_ai_quota(db, user.id, add_requests=1)
+            if not guard.allowed:
+                await update.message.reply_text(t(guard.reason, locale=locale))
+                return
+            guard = _breaker().is_open()
+            if not guard.allowed:
+                await update.message.reply_text(
+                    t(guard.reason, locale=locale, retry_after=guard.retry_after)
+                )
+                return
+            ai_lock = await _acquire_heavy_lock(user, update, text=text, locale=locale)
+            if not ai_lock:
+                return
+            data = parse_intent(text, settings.OPENAI_API_KEY, settings.OPENAI_CHAT_MODEL, locale=locale)
+            record_ai_request(db, user.id, count=1)
+            if data:
+                handled = await _handle_ai_intent(
+                    data,
+                    text,
+                    update,
+                    context,
+                    db,
+                    user,
+                    locale=locale,
+                )
+                if handled:
+                    return
+
+        if not _should_create_task(text):
+            if ai_enabled:
+                guard = check_ai_quota(db, user.id, add_requests=1)
+                if not guard.allowed:
+                    await update.message.reply_text(t(guard.reason, locale=locale))
+                    return
+                guard = _breaker().is_open()
+                if not guard.allowed:
+                    await update.message.reply_text(
+                        t(guard.reason, locale=locale, retry_after=guard.retry_after)
+                    )
+                    return
+                if not ai_lock:
+                    ai_lock = await _acquire_heavy_lock(user, update, text=text, locale=locale)
+                    if not ai_lock:
+                        return
+                context_prompt = _build_assistant_context(db, user)
+                history = _get_chat_history(context)
+                reply = chat_reply(
+                    text,
+                    settings.OPENAI_API_KEY,
+                    settings.OPENAI_CHAT_MODEL,
+                    system_prompt=_assistant_system_prompt(locale),
+                    context_prompt=context_prompt,
+                    history=history,
+                )
+                record_ai_request(db, user.id, count=1)
+                if reply:
+                    _append_chat_history(context, "user", text)
+                    _append_chat_history(context, "assistant", reply)
+                    await update.message.reply_text(reply)
+                    return
+                await update.message.reply_text(t("ai.chat.failed", locale=locale))
+                return
+            await update.message.reply_text(t("ai.hint.create_task", locale=locale))
             return
-        await update.message.reply_text("Если нужно создать задачу, скажите: «создай задачу ...»")
-        return
+    finally:
+        if ai_lock:
+            ai_lock.release()
+
     await _handle_task_request(
         text,
         update,
@@ -793,8 +986,24 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
         user = await _get_active_user(update, context, db)
         if not user:
             return
+        locale = locale_for_user(user)
 
         voice = update.message.voice
+        guard = check_audio_limits(voice.duration, voice.file_size)
+        if not guard.allowed:
+            await update.message.reply_text(t(guard.reason, locale=locale))
+            return
+        guard = check_transcribe_quota(db, user.id, add_seconds=int(voice.duration or 0))
+        if not guard.allowed:
+            await update.message.reply_text(t(guard.reason, locale=locale))
+            return
+        guard = _breaker().is_open()
+        if not guard.allowed:
+            await update.message.reply_text(
+                t(guard.reason, locale=locale, retry_after=guard.retry_after)
+            )
+            return
+
         file = await context.bot.get_file(voice.file_id)
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "voice.ogg"
@@ -807,13 +1016,11 @@ async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYP
             )
 
         if not transcript:
-            await update.message.reply_text(
-                "Голос получен, но распознавание не включено. "
-                "Установите OPENAI_API_KEY или отправьте текст."
-            )
+            await update.message.reply_text(t("ai.transcribe.disabled", locale=locale))
             return
 
-        await update.message.reply_text(f"Распознано: {transcript}")
+        record_transcribe_seconds(db, user.id, seconds=int(voice.duration or 0))
+        await update.message.reply_text(t("ai.transcribe.heard", locale=locale, text=transcript))
         if await _handle_onboarding_text(transcript, update, context, db, user):
             return
         await _process_user_text(transcript, update, context, db, user)

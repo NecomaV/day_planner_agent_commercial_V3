@@ -5,6 +5,7 @@ from telegram.ext import ContextTypes
 from app import crud
 from app.bot.context import get_db_session
 from app.bot.utils import distance_m, now_local_naive
+from app.i18n.core import locale_for_user, t
 from app.services.reminders import format_reminder_message
 from app.settings import settings
 
@@ -17,6 +18,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         for user_id, user in users.items():
             if not getattr(user, "is_active", True):
                 continue
+            locale = locale_for_user(user)
             tasks = crud.list_tasks_for_reminders(db, user_id, now, settings.REMINDER_LEAD_MIN)
             if not tasks:
                 continue
@@ -26,7 +28,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 chat_id = user.telegram_chat_id
 
             try:
-                message = format_reminder_message(tasks)
+                message = format_reminder_message(tasks, locale=locale)
                 await context.bot.send_message(chat_id=chat_id, text=message)
             except Exception:
                 continue
@@ -38,6 +40,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         for user_id, user in users.items():
             if not getattr(user, "is_active", True):
                 continue
+            locale = locale_for_user(user)
             late_tasks = crud.list_late_tasks(db, user_id, now, settings.DELAY_GRACE_MIN)
             if not late_tasks:
                 continue
@@ -49,9 +52,11 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=(
-                            f"You are running late for task: {task.title} (id={task.id}). "
-                            "Use /delay <id> <minutes>."
+                        text=t(
+                            "reminders.late_prompt",
+                            locale=locale,
+                            title=task.title,
+                            task_id=task.id,
                         ),
                     )
                     task.late_prompt_sent_at = now
@@ -62,6 +67,7 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         for user_id, user in users.items():
             if not getattr(user, "is_active", True):
                 continue
+            locale = locale_for_user(user)
             if user.last_lat is None or user.last_lon is None or user.last_location_at is None:
                 continue
             if (now - user.last_location_at) > dt.timedelta(minutes=settings.LOCATION_STALE_MIN):
@@ -84,9 +90,12 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id,
-                        text=(
-                            "\u0412\u044b \u0440\u044f\u0434\u043e\u043c \u0441 \u043b\u043e\u043a\u0430\u0446\u0438\u0435\u0439"
-                            f"{label}. \u0417\u0430\u0434\u0430\u0447\u0430: {task.title} (id={task.id})"
+                        text=t(
+                            "reminders.location",
+                            locale=locale,
+                            label=label,
+                            title=task.title,
+                            task_id=task.id,
                         ),
                     )
                     task.location_reminder_sent_at = now

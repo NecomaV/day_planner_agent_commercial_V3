@@ -264,7 +264,7 @@ function formatWeekLabel(days) {
 function buildHeaders() {
   const userToken = apiKeyInput.value.trim();
   if (!userToken) {
-    throw new Error('Enter API token.');
+    throw new Error('Введите API токен.');
   }
   const headers = {
     Authorization: `Bearer ${userToken}`,
@@ -280,7 +280,7 @@ function buildHeaders() {
 async function fetchJson(url, headers) {
   const response = await fetch(url, { headers });
   if (!response.ok) {
-    let detail = response.statusText || 'Request failed';
+    let detail = response.statusText || 'Запрос не выполнен';
     try {
       const body = await response.json();
       if (body && body.detail) {
@@ -761,7 +761,7 @@ async function patchTask(taskId, payload) {
     body: JSON.stringify(payload),
   });
   if (!response.ok) {
-    let detail = response.statusText || 'Request failed';
+    let detail = response.statusText || 'Запрос не выполнен';
     try {
       const body = await response.json();
       if (body && body.detail) detail = body.detail;
@@ -780,7 +780,7 @@ async function deleteTask(taskId) {
     headers,
   });
   if (!response.ok) {
-    let detail = response.statusText || 'Request failed';
+    let detail = response.statusText || 'Запрос не выполнен';
     try {
       const body = await response.json();
       if (body && body.detail) detail = body.detail;

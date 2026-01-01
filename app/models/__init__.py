@@ -8,6 +8,7 @@ from .task import Task
 from .reminder import Reminder
 from .workout import WorkoutPlan
 from .health import DailyCheckin, Habit, HabitLog
+from .usage import UsageCounter
 
 __all__ = [
     "Base",
@@ -22,4 +23,5 @@ __all__ = [
     "DailyCheckin",
     "Habit",
     "HabitLog",
+    "UsageCounter",
 ]

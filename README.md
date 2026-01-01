@@ -39,6 +39,10 @@ cp .env.example .env
 - `OPENAI_TRANSCRIBE_MODEL` controls the speech-to-text model (default `whisper-1`).
 - `OPENAI_CHAT_MODEL` controls the AI model for intent parsing (default `gpt-4o-mini`).
 - `OPENAI_TRANSCRIBE_LANGUAGE` hints transcription language (default `ru`).
+- `AI_*` caps control daily quotas and request limits for AI usage.
+- `API_RATE_*` and `AUTH_*` control API rate limiting and abuse protection.
+- `BOT_*` controls Telegram throttling and dedupe behavior.
+- `REDIS_URL` enables shared rate limiting across multiple API instances (optional).
 
 ## 3) Create / migrate DB (Alembic)
 
@@ -71,6 +75,10 @@ python run_telegram_bot.py
 python -m app.worker
 ```
 
+## Token rotation
+- Run `/token` in Telegram to rotate your API token.
+- Old tokens are immediately invalidated.
+
 ## Docker (Postgres)
 
 ```bash
@@ -96,6 +104,7 @@ docker compose up --build
 - `/cabinet` - show account status and quick stats
 - `/login` - activate account
 - `/logout` - deactivate account
+- `/lang ru|en` - switch language
 - `/slots <id> [YYYY-MM-DD]` - show slots for a task
 - `/place <id> <slot#> [HH:MM]` - place task into a slot
 - `/schedule <id> <HH:MM> [YYYY-MM-DD]` - schedule by time
@@ -106,6 +115,11 @@ docker compose up --build
 - Voice messages require `OPENAI_API_KEY` to enable transcription.
 - Free-text parsing is improved when `OPENAI_API_KEY` is set.
 - New users are guided through an onboarding wizard on `/start`.
+
+## How to add or update Telegram messages
+1) Add or edit a key in `app/i18n/ru.json` (Russian is default).
+2) Optionally add the English fallback in `app/i18n/en.json`.
+3) Use `t("key", locale=locale, **vars)` in bot handlers/rendering.
 
 ## Key concepts implemented
 
@@ -145,9 +159,7 @@ So a 60-minute workout becomes:
 - autoplan ensures start is not placed immediately after breakfast
 
 ## Commercial hardening roadmap (next)
-- Auth for API (JWT or per-user API keys)
 - Billing (Stripe)
-- Tenant isolation at API level (not only Telegram)
-- Observability (structured logs, Sentry)
-- Background jobs (Celery/RQ) + reminders
+- Analytics and admin tooling
+- Mobile apps and desktop clients
 - Rate limiting and abuse prevention

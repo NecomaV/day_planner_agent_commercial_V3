@@ -1,33 +1,5 @@
-def start_help_message() -> str:
-    return (
-        "Дневной планировщик.\n\n"
-        "Команды:\n"
-        "/me - cabinet info\n"
-        "/token - get API token\n"
-        "/todo <минуты> <текст> - добавить задачу в бэклог\n"
-        "/capture <текст> - быстрое добавление с датой/временем\n"
-        "/call <имя> [заметки] - зафиксировать звонок и создать фоллоу-ап\n"
-        "/plan [YYYY-MM-DD] - показать план\n"
-        "/autoplan <дни> [YYYY-MM-DD] - распланировать бэклог\n"
-        "/morning - утренняя рутина на сегодня\n"
-        "/routine_add <смещение> <длительность> <название> [| тип]\n"
-        "/routine_list - список шагов рутины\n"
-        "/routine_del <id> - удалить шаг рутины\n"
-        "/pantry add|remove|list <продукт>\n"
-        "/breakfast - предложить завтрак из продуктов\n"
-        "/health checkin|today - здоровье (сон/энергия/вода)\n"
-        "/habit add|log|list - привычки\n"
-        "/workout today|show|set|clear|list ...\n"
-        "/task_location <id> [радиус] [метка] - привязать локацию к задаче\n"
-        "/delay <id> <минуты> - перенести задачу\n"
-        "/cabinet - кабинет и статистика\n"
-        "/setup - пройти настройку заново\n"
-        "/login - включить аккаунт\n"
-        "/logout - выключить аккаунт\n"
-        "/slots <id> [YYYY-MM-DD] - доступные слоты\n"
-        "/place <id> <slot#> [HH:MM] - поставить в слот\n"
-        "/schedule <id> <HH:MM> [YYYY-MM-DD] - запланировать по времени\n"
-        "/unschedule <id> - вернуть в бэклог\n"
-        "/done <id> - отметить выполненной\n"
-        "/delete <id> - удалить задачу\n"
-    )
+from app.i18n.core import t
+
+
+def start_help_message(locale: str = "ru") -> str:
+    return t("help.start", locale=locale)
