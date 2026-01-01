@@ -1,6 +1,7 @@
+﻿from __future__ import annotations
+
 import datetime as dt
 import re
-
 
 MONTH_MAP = {
     "января": 1,
@@ -17,24 +18,10 @@ MONTH_MAP = {
     "декабря": 12,
 }
 
-
-MONTH_RE = re.compile(r"\b(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\b", re.IGNORECASE)
-
-
-DATE_LIST_RE = re.compile(
-    r"((?:\d{1,2}(?:-?е|го)?\s*(?:,|и|или)?\s*)+)\s*(?:числа|число)?\s*(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)",
-    re.IGNORECASE,
-)
-
-
-DATE_RANGE_RE = re.compile(
-    r"\b(?:с|со)\s+(\d{1,2})(?:-?е|го)?\s+(?:по|до)\s+(\d{1,2})(?:-?е|го)?\s*(?:числа|число)?\s*(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)?",
-    re.IGNORECASE,
-)
-
+MONTH_PATTERN = "|".join(MONTH_MAP.keys())
+MONTH_RE = re.compile(r"\b(" + MONTH_PATTERN + r")\b", re.IGNORECASE)
 
 DATE_TOKEN_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
-
 
 RUS_WEEKDAY_MAP = {
     "пн": 0,
@@ -53,6 +40,73 @@ RUS_WEEKDAY_MAP = {
     "воскресенье": 6,
 }
 
+DATE_RANGE_RE = re.compile(
+    r"\b(?:с|со)\s+(\d{1,2})(?:-?е|го)?\s+(?:по|до)\s+(\d{1,2})(?:-?е|го)?\b(?!\s*(?:" + MONTH_PATTERN + r"))",
+    re.IGNORECASE,
+)
+
+DATE_RANGE_MONTH_RE = re.compile(
+    r"\b(?:с|со)\s+(\d{1,2})(?:-?е|го)?\s+(?:по|до)\s+(\d{1,2})(?:-?е|го)?\s*(" + MONTH_PATTERN + r")\b",
+    re.IGNORECASE,
+)
+
+DATE_LIST_RE = re.compile(
+    r"\b((?:\d{1,2}(?:-?е|го)?(?:\s*[,-]\s*|\s+и\s+)?)+)\s*(" + MONTH_PATTERN + r")\b",
+    re.IGNORECASE,
+)
+
+DAY_MONTH_RE = re.compile(
+    r"\b(\d{1,2})\s*(?:-?е|го)?\s*(" + MONTH_PATTERN + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _build_ordinal_day_map() -> dict[str, int]:
+    base = {
+        1: ["первое", "первого", "первый"],
+        2: ["второе", "второго", "второй"],
+        3: ["третье", "третьего", "третий"],
+        4: ["четвертое", "четвертого", "четвертый"],
+        5: ["пятое", "пятого", "пятый"],
+        6: ["шестое", "шестого", "шестой"],
+        7: ["седьмое", "седьмого", "седьмой"],
+        8: ["восьмое", "восьмого", "восьмой"],
+        9: ["девятое", "девятого", "девятый"],
+        10: ["десятое", "десятого", "десятый"],
+        11: ["одиннадцатое", "одиннадцатого", "одиннадцатый"],
+        12: ["двенадцатое", "двенадцатого", "двенадцатый"],
+        13: ["тринадцатое", "тринадцатого", "тринадцатый"],
+        14: ["четырнадцатое", "четырнадцатого", "четырнадцатый"],
+        15: ["пятнадцатое", "пятнадцатого", "пятнадцатый"],
+        16: ["шестнадцатое", "шестнадцатого", "шестнадцатый"],
+        17: ["семнадцатое", "семнадцатого", "семнадцатый"],
+        18: ["восемнадцатое", "восемнадцатого", "восемнадцатый"],
+        19: ["девятнадцатое", "девятнадцатого", "девятнадцатый"],
+        20: ["двадцатое", "двадцатого", "двадцатый"],
+        30: ["тридцатое", "тридцатого", "тридцатый"],
+    }
+
+    mapping: dict[str, int] = {}
+    for day, forms in base.items():
+        for form in forms:
+            mapping[form] = day
+
+    tens_word = {20: "двадцать", 30: "тридцать"}
+    for tens, word in tens_word.items():
+        for unit in range(1, 10):
+            for form in base[unit]:
+                mapping[f"{word} {form}"] = tens + unit
+
+    return mapping
+
+
+ORDINAL_DAY_MAP = _build_ordinal_day_map()
+ORDINAL_WORDS = sorted(ORDINAL_DAY_MAP.keys(), key=len, reverse=True)
+ORDINAL_DAY_MONTH_RE = re.compile(
+    r"\b(" + "|".join(re.escape(word) for word in ORDINAL_WORDS) + r")\s+(" + MONTH_PATTERN + r")\b",
+    re.IGNORECASE,
+)
+
 
 def _normalize_year(day: int, month: int, now: dt.datetime) -> int:
     year = now.year
@@ -67,17 +121,19 @@ def _normalize_year(day: int, month: int, now: dt.datetime) -> int:
 
 def _extract_dates_from_text(text: str, now: dt.datetime) -> list[dt.date]:
     dates: set[dt.date] = set()
-    for m in re.finditer(r"\b(\d{4}-\d{2}-\d{2})\b", text):
+    lower = text.lower()
+
+    for m in DATE_TOKEN_RE.finditer(text):
         try:
             dates.add(dt.date.fromisoformat(m.group(1)))
         except ValueError:
             continue
 
-    for match in DATE_RANGE_RE.finditer(text):
+    for match in DATE_RANGE_MONTH_RE.finditer(lower):
         start_day = int(match.group(1))
         end_day = int(match.group(2))
         month_token = match.group(3)
-        month = MONTH_MAP.get(month_token.lower()) if month_token else now.month
+        month = MONTH_MAP.get(month_token)
         if not month:
             continue
         start = min(start_day, end_day)
@@ -89,9 +145,22 @@ def _extract_dates_from_text(text: str, now: dt.datetime) -> list[dt.date]:
             except ValueError:
                 continue
 
-    for match in DATE_LIST_RE.finditer(text):
+    for match in DATE_RANGE_RE.finditer(lower):
+        start_day = int(match.group(1))
+        end_day = int(match.group(2))
+        month = now.month
+        start = min(start_day, end_day)
+        end = max(start_day, end_day)
+        for day in range(start, end + 1):
+            year = _normalize_year(day, month, now)
+            try:
+                dates.add(dt.date(year, month, day))
+            except ValueError:
+                continue
+
+    for match in DATE_LIST_RE.finditer(lower):
         days_raw = match.group(1)
-        month_token = match.group(2).lower()
+        month_token = match.group(2)
         month = MONTH_MAP.get(month_token)
         if not month:
             continue
@@ -103,8 +172,33 @@ def _extract_dates_from_text(text: str, now: dt.datetime) -> list[dt.date]:
             except ValueError:
                 continue
 
-    if not dates and re.search(r"\bчисл", text.lower()):
-        for day_str in re.findall(r"\b\d{1,2}\b", text):
+    for match in ORDINAL_DAY_MONTH_RE.finditer(lower):
+        word = match.group(1)
+        month_token = match.group(2)
+        day = ORDINAL_DAY_MAP.get(word)
+        month = MONTH_MAP.get(month_token)
+        if not day or not month:
+            continue
+        year = _normalize_year(day, month, now)
+        try:
+            dates.add(dt.date(year, month, day))
+        except ValueError:
+            continue
+
+    for match in DAY_MONTH_RE.finditer(lower):
+        day = int(match.group(1))
+        month_token = match.group(2)
+        month = MONTH_MAP.get(month_token)
+        if not month:
+            continue
+        year = _normalize_year(day, month, now)
+        try:
+            dates.add(dt.date(year, month, day))
+        except ValueError:
+            continue
+
+    if not dates and "числ" in lower and not MONTH_RE.search(lower):
+        for day_str in re.findall(r"\b\d{1,2}\b", lower):
             day = int(day_str)
             month = now.month
             year = _normalize_year(day, month, now)
@@ -127,6 +221,26 @@ def _detect_relative_day(text: str, now: dt.datetime) -> dt.date | None:
     return None
 
 
+def resolve_date_ru(text: str, now: dt.datetime) -> dt.date | None:
+    dates = _extract_dates_from_text(text, now)
+    if dates:
+        return dates[0]
+    relative = _detect_relative_day(text, now)
+    if relative:
+        return relative
+    m = re.search(
+        r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b",
+        text.lower(),
+    )
+    if m:
+        token = m.group(2)
+        target = RUS_WEEKDAY_MAP.get(token, now.weekday())
+        days_ahead = (target - now.weekday() + 7) % 7
+        days_ahead = 7 if days_ahead == 0 else days_ahead
+        return now.date() + dt.timedelta(days=days_ahead)
+    return None
+
+
 def _parse_duration_minutes(text: str) -> int | None:
     lower = text.lower()
     m = re.search(r"\b(\d{1,3})\s*(мин|минут|минуты|m)\b", lower)
@@ -144,7 +258,7 @@ def _parse_duration_minutes(text: str) -> int | None:
 def _parse_time_range(text: str) -> tuple[dt.time, dt.time] | None:
     lower = text.lower()
     range_match = re.search(
-        r"(?:с\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:-|-|–|—|до|по)\s*(\d{1,2})(?::(\d{2}))?",
+        r"(?:с\s*)?(\d{1,2})(?::(\d{2}))?\s*(?:-|–|—|до|по)\s*(\d{1,2})(?::(\d{2}))?",
         lower,
     )
     if not range_match:
@@ -174,7 +288,8 @@ def _parse_time_value(text: str) -> dt.time | None:
         return dt.time(12, 0)
     if "полночь" in lower:
         return dt.time(0, 0)
-    range_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*[---]\s*(\d{1,2})(?::(\d{2}))?", lower)
+
+    range_match = re.search(r"(\d{1,2})(?::(\d{2}))?\s*[-–—]\s*(\d{1,2})(?::(\d{2}))?", lower)
     meridian_pm = bool(re.search(r"\b(pm|вечера|дня)\b", lower))
     meridian_am = bool(re.search(r"\b(am|утра|ночи)\b", lower))
 
@@ -201,7 +316,7 @@ def _parse_time_value(text: str) -> dt.time | None:
         midpoint = start + (end - start) / 2
         return midpoint.time().replace(second=0, microsecond=0)
 
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?", lower)
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\b", lower)
     if m:
         hh = apply_meridian(int(m.group(1)))
         mm = int(m.group(2) or 0)
@@ -210,8 +325,11 @@ def _parse_time_value(text: str) -> dt.time | None:
         return dt.time(hh, mm)
 
     word_map = {
+        "ноль": 0,
         "один": 1,
+        "одна": 1,
         "два": 2,
+        "две": 2,
         "три": 3,
         "четыре": 4,
         "пять": 5,
@@ -230,19 +348,23 @@ def _parse_time_value(text: str) -> dt.time | None:
         "восемнадцать": 18,
         "девятнадцать": 19,
         "двадцать": 20,
-        "полдня": 12,
+        "двадцать один": 21,
+        "двадцать два": 22,
+        "двадцать три": 23,
     }
-    for word, hour in word_map.items():
-        if re.search(rf"\b{word}\b", lower):
-            hh = apply_meridian(hour)
+
+    for word in sorted(word_map.keys(), key=len, reverse=True):
+        if re.search(rf"\b{re.escape(word)}\b", lower):
+            hh = apply_meridian(word_map[word])
             if hh > 23:
                 return None
             return dt.time(hh, 0)
+
     return None
 
 
 def _has_due_intent(text: str) -> bool:
-    return bool(re.search(r"\b(до|дедлайн|deadline|срок)\b", text.lower()))
+    return bool(re.search(r"\b(срок|дедлайн|deadline)\b", text.lower()))
 
 
 def _resolve_date_for_time(now: dt.datetime, date: dt.date | None, time_value: dt.time) -> dt.datetime:
@@ -257,9 +379,11 @@ def _format_date_list(dates: list[dt.date]) -> str:
     return ", ".join(sorted({d.isoformat() for d in dates}))
 
 
-def _extract_task_timing(text: str, now: dt.datetime) -> tuple[dt.date | None, tuple[dt.time, dt.time] | None, dt.time | None, int | None]:
-    dates = _extract_dates_from_text(text, now)
-    date = dates[0] if dates else _detect_relative_day(text, now)
+def _extract_task_timing(
+    text: str,
+    now: dt.datetime,
+) -> tuple[dt.date | None, tuple[dt.time, dt.time] | None, dt.time | None, int | None]:
+    date = resolve_date_ru(text, now)
     time_range = _parse_time_range(text)
     time_value = _parse_time_value(text)
     duration = _parse_duration_minutes(text)
@@ -272,24 +396,5 @@ def _extract_task_timing(text: str, now: dt.datetime) -> tuple[dt.date | None, t
 
 
 def _detect_day_from_text(text: str, now: dt.datetime) -> dt.date:
-    lower = text.lower()
-    if "сегодня" in lower or "today" in lower:
-        return now.date()
-    if "послезавтра" in lower:
-        return now.date() + dt.timedelta(days=2)
-    if "завтра" in lower or "tomorrow" in lower:
-        return now.date() + dt.timedelta(days=1)
-    m = DATE_TOKEN_RE.search(text)
-    if m:
-        try:
-            return dt.date.fromisoformat(m.group(1))
-        except ValueError:
-            pass
-    m = re.search(r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b", lower)
-    if m:
-        token = m.group(2)
-        target = RUS_WEEKDAY_MAP.get(token, now.weekday())
-        days_ahead = (target - now.weekday() + 7) % 7
-        days_ahead = 7 if days_ahead == 0 else days_ahead
-        return now.date() + dt.timedelta(days=days_ahead)
-    return now.date()
+    resolved = resolve_date_ru(text, now)
+    return resolved or now.date()

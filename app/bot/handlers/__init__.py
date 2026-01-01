@@ -3,6 +3,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from app.bot.middleware.throttle import wrap_throttled
 from app.bot.handlers.core import (
     cmd_cabinet,
+    cmd_debug_db,
     cmd_lang,
     cmd_login,
     cmd_logout,
@@ -54,6 +55,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("task_location", wrap_throttled(cmd_task_location)))
     app.add_handler(CommandHandler("delay", wrap_throttled(cmd_delay)))
     app.add_handler(CommandHandler("cabinet", wrap_throttled(cmd_cabinet)))
+    app.add_handler(CommandHandler("debug_db", wrap_throttled(cmd_debug_db)))
     app.add_handler(CommandHandler("setup", wrap_throttled(cmd_setup)))
     app.add_handler(CommandHandler("login", wrap_throttled(cmd_login)))
     app.add_handler(CommandHandler("logout", wrap_throttled(cmd_logout)))

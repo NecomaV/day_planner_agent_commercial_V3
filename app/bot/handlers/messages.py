@@ -53,13 +53,15 @@ from app.bot.parsing.text import (
 from app.bot.parsing.time import (
     DATE_TOKEN_RE,
     MONTH_RE,
-    RUS_WEEKDAY_MAP,
     _detect_relative_day,
     _extract_dates_from_text,
+    _extract_task_timing,
     _format_date_list,
+    resolve_date_ru,
 )
 from app.bot.rendering.keyboard import yes_no_cancel_keyboard, yes_no_keyboard
 from app.bot.rendering.tasks import render_day_plan as _render_day_plan
+from app.services.slots import task_display_minutes
 from app.bot.throttle import throttle
 from app.bot.utils import now_local_naive as _now_local_naive
 from app.i18n.core import locale_for_user, t
@@ -345,36 +347,48 @@ def _assistant_system_prompt(locale: str) -> str:
         f"Respond in {language}."
     )
 
+def _remember_plan_context(context: ContextTypes.DEFAULT_TYPE, day: dt.date, tasks: list, backlog: list) -> None:
+    context.user_data["last_plan_day"] = day.isoformat()
+    context.user_data["last_plan_task_ids"] = [t.id for t in tasks] + [t.id for t in backlog]
 
-def _detect_day_from_text(text: str, now: dt.datetime) -> dt.date:
-    lower = text.lower()
-    if "сегодня" in lower or "today" in lower:
-        return now.date()
-    if "послезавтра" in lower:
-        return now.date() + dt.timedelta(days=2)
-    if "завтра" in lower or "tomorrow" in lower:
-        return now.date() + dt.timedelta(days=1)
-    m = DATE_TOKEN_RE.search(text)
-    if m:
-        try:
-            return dt.date.fromisoformat(m.group(1))
-        except ValueError:
-            pass
-    m = re.search(
-        r"\b(следующ(?:ий|ая|ее)\s+)?(пн|вт|ср|чт|пт|сб|вс|понедельник|вторник|среда|четверг|пятница|суббота|воскресенье)\b",
-        lower,
+
+def _sanitize_ai_reply(reply: str | None, locale: str) -> str | None:
+    if not reply:
+        return reply
+    lower = reply.lower()
+    if "доступ" in lower and "будущ" in lower:
+        return t("ai.no_future", locale=locale)
+    return reply
+
+
+def _format_task_choice(task, routine, locale: str) -> str:
+    if task.planned_start:
+        when = task.planned_start.strftime("%H:%M")
+    elif task.due_at:
+        when = task.due_at.strftime("%Y-%m-%d %H:%M")
+    else:
+        when = t("tasks.choice.no_time", locale=locale)
+    mins = task_display_minutes(task, routine)
+    return t(
+        "tasks.choice.line",
+        locale=locale,
+        task_id=task.id,
+        title=task.title,
+        when=when,
+        minutes=mins,
     )
-    if m:
-        token = m.group(2)
-        target = RUS_WEEKDAY_MAP.get(token, now.weekday())
-        days_ahead = (target - now.weekday() + 7) % 7
-        days_ahead = 7 if days_ahead == 0 else days_ahead
-        return now.date() + dt.timedelta(days=days_ahead)
-    return now.date()
 
 
 def _is_plan_request(text: str) -> bool:
     return bool(re.search(r"\b(план|расписание|график|розклад|plan)\b", text, flags=re.IGNORECASE))
+
+
+def _is_tasks_request(text: str) -> bool:
+    return bool(re.search(r"\b(задач|задачи|список задач|todo|tasks)\b", text, flags=re.IGNORECASE))
+
+
+def _is_backlog_request(text: str) -> bool:
+    return bool(re.search(r"\b(бэклог|беклог|backlog)\b", text, flags=re.IGNORECASE))
 
 
 def _is_breakfast_request(text: str) -> bool:
@@ -383,6 +397,74 @@ def _is_breakfast_request(text: str) -> bool:
 
 def _is_autoplan_request(text: str) -> bool:
     return bool(re.search(r"\b(автоплан|autoplan|распланируй|распланировать)\b", text, flags=re.IGNORECASE))
+
+
+def _parse_reschedule_request(text: str, now: dt.datetime) -> dict | None:
+    lower = text.lower()
+    if not re.search(r"\b(перенеси|перенести|сдвинь|сдвинуть|перепланируй|перепланировать|запланируй|поставь)\b", lower):
+        return None
+    ids = _extract_task_ids(text)
+    if not ids:
+        return None
+    date_hint, time_range, time_value, duration = _extract_task_timing(text, now)
+    if time_range:
+        start_time = time_range[0]
+        end_time = time_range[1]
+        duration = int((dt.datetime.combine(now.date(), end_time) - dt.datetime.combine(now.date(), start_time)).total_seconds() // 60)
+    elif time_value:
+        start_time = time_value
+    else:
+        return None
+    date = date_hint or now.date()
+    return {
+        "task_id": ids[0],
+        "date": date,
+        "time": start_time,
+        "duration": duration,
+    }
+
+
+def _normalize_action_text(text: str) -> str:
+    cleaned = text.lower()
+    cleaned = re.sub(r"[^\w\s-]", " ", cleaned)
+    cleaned = re.sub(
+        r"\b(удали|удалить|удалилась|удалился|задача|задачи|пожалуйста|плиз|прошу|нужно|надо)\b",
+        " ",
+        cleaned,
+    )
+    return " ".join(cleaned.split()).strip()
+
+
+def _match_tasks_by_title(tasks: list, query: str) -> list:
+    if not query:
+        return []
+    hits = []
+    for task in tasks:
+        title = (task.title or "").lower()
+        if query in title:
+            hits.append(task)
+    return hits
+
+
+def _resolve_done_candidate(db, user, routine, now: dt.datetime) -> list:
+    day = now.date()
+    tasks = crud.list_tasks_for_day(db, user.id, day)
+    scheduled = [t for t in tasks if t.planned_start and not t.is_done]
+    if not scheduled:
+        return []
+    active = [t for t in scheduled if t.planned_end and t.planned_start <= now <= t.planned_end]
+    if len(active) == 1:
+        return active
+    recent = [
+        t
+        for t in scheduled
+        if t.planned_end and t.planned_end <= now and (now - t.planned_end).total_seconds() <= 3600
+    ]
+    if len(recent) == 1:
+        return recent
+    if len(scheduled) == 1:
+        return scheduled
+    return []
 
 
 def _parse_autoplan_args(text: str) -> list[str]:
@@ -637,11 +719,13 @@ async def _handle_ai_intent(
 
     if intent == "plan":
         routine = crud.get_routine(db, user.id)
-        day = _now_local_naive().date()
+        now = _now_local_naive()
+        day = resolve_date_ru(original_text, now) or now.date()
         ensure_day_anchors(db, user.id, day, routine)
         tasks = crud.list_tasks_for_day(db, user.id, day)
         scheduled = [t for t in tasks if t.planned_start and not t.is_done]
         backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
+        _remember_plan_context(context, day, scheduled, backlog)
         await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine, locale=locale))
         return True
 
@@ -788,15 +872,43 @@ async def _process_user_text(
         if ids:
             await _apply_task_actions("delete", ids, update, db, user)
         else:
-            await _prompt_task_selection("delete", update, context, db, user, routine)
+            raw_day = context.user_data.get("last_plan_day") if context else None
+            day = None
+            if raw_day:
+                try:
+                    day = dt.date.fromisoformat(str(raw_day))
+                except ValueError:
+                    day = None
+            if day is None:
+                day = _now_local_naive().date()
+            tasks = crud.list_tasks_for_day(db, user.id, day)
+            query = _normalize_action_text(text)
+            matches = _match_tasks_by_title([t for t in tasks if not t.is_done], query)
+            if len(matches) == 1:
+                await _apply_task_actions("delete", [matches[0].id], update, db, user)
+            elif matches:
+                context.user_data["pending_action"] = {
+                    "action": "delete",
+                    "candidate_ids": [t.id for t in matches],
+                }
+                lines = [t("tasks.selection.header", locale=locale)]
+                lines.extend([_format_task_choice(t, routine, locale) for t in matches])
+                lines.append(t("tasks.selection.hint", locale=locale))
+                await update.message.reply_text("\n".join(lines))
+            else:
+                await _prompt_task_selection("delete", update, context, db, user, routine)
         return
 
-    if any(word in lower for word in ["сделано", "готово", "закрыть", "завершить", "done"]):
+    if any(word in lower for word in ["сделано", "готово", "закрыть", "завершить", "выполнено", "выполненной", "done"]):
         ids = _extract_task_ids(text)
         if ids:
             await _apply_task_actions("done", ids, update, db, user)
         else:
-            await _prompt_task_selection("done", update, context, db, user, routine)
+            candidates = _resolve_done_candidate(db, user, routine, _now_local_naive())
+            if candidates:
+                await _apply_task_actions("done", [t.id for t in candidates], update, db, user)
+            else:
+                await _prompt_task_selection("done", update, context, db, user, routine)
         return
 
     if any(word in lower for word in ["убери из расписания", "сними с плана", "перенеси в бэклог", "unschedule"]):
@@ -807,21 +919,52 @@ async def _process_user_text(
             await _prompt_task_selection("unschedule", update, context, db, user, routine)
         return
 
+    reschedule = _parse_reschedule_request(text, _now_local_naive())
+    if reschedule:
+        task_id = reschedule["task_id"]
+        target_date = reschedule["date"]
+        target_time = reschedule["time"]
+        duration = reschedule["duration"]
+        task = crud.reschedule_task(
+            db,
+            user.id,
+            task_id=task_id,
+            target_date=target_date,
+            target_time=target_time,
+            duration_min=duration,
+            schedule_source="manual",
+        )
+        if not task:
+            await update.message.reply_text(t("tasks.reschedule.not_found", locale=locale, task_id=task_id))
+            return
+        await update.message.reply_text(
+            t(
+                "tasks.reschedule.success",
+                locale=locale,
+                task_id=task.id,
+                date=target_date.isoformat(),
+                start=target_time.strftime("%H:%M"),
+            )
+        )
+        return
+
     if _is_autoplan_request(text):
         args = _parse_autoplan_args(text)
         await _run_command_with_throttle("autoplan", args, update, context, user)
         return
 
-    if _is_plan_request(text):
+    if _is_plan_request(text) or _is_tasks_request(text):
         lock = await _acquire_heavy_lock(user, update, text=text, locale=locale)
         if not lock:
             return
         try:
-            day = _detect_day_from_text(text, _now_local_naive())
+            now = _now_local_naive()
+            day = resolve_date_ru(text, now) or now.date()
             ensure_day_anchors(db, user.id, day, routine)
             tasks = crud.list_tasks_for_day(db, user.id, day)
             scheduled = [t for t in tasks if t.planned_start and not t.is_done]
             backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
+            _remember_plan_context(context, day, scheduled, backlog)
             await update.message.reply_text(_render_day_plan(scheduled, backlog, day, routine, locale=locale))
         finally:
             lock.release()
@@ -851,6 +994,27 @@ async def _process_user_text(
                 )
             else:
                 lines.append(t("pantry.breakfast.item_ready", locale=locale, name=s["name"]))
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if _is_backlog_request(text):
+        backlog = crud.list_backlog(db, user.id)
+        if not backlog:
+            await update.message.reply_text(t("backlog.empty", locale=locale))
+            return
+        lines = [t("backlog.header", locale=locale)]
+        for idx, task in enumerate(backlog, start=1):
+            minutes = task_display_minutes(task, routine)
+            lines.append(
+                t(
+                    "backlog.line",
+                    locale=locale,
+                    index=idx,
+                    title=task.title,
+                    minutes=minutes,
+                    task_id=task.id,
+                )
+            )
         await update.message.reply_text("\n".join(lines))
         return
 
@@ -938,6 +1102,7 @@ async def _process_user_text(
                     context_prompt=context_prompt,
                     history=history,
                 )
+                reply = _sanitize_ai_reply(reply, locale)
                 record_ai_request(db, user.id, count=1)
                 if reply:
                     _append_chat_history(context, "user", text)

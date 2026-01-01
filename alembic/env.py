@@ -11,7 +11,7 @@ from alembic import context
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from app.settings import settings  # noqa: E402
-from app.db import _ensure_sqlite_dir  # noqa: E402
+from app.db import RESOLVED_DATABASE_URL, _ensure_sqlite_dir  # noqa: E402
 from app.models import Base  # noqa: E402
 
 
@@ -21,8 +21,8 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 # Override URL from settings (.env supported)
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
-_ensure_sqlite_dir(settings.DATABASE_URL)
+config.set_main_option("sqlalchemy.url", RESOLVED_DATABASE_URL)
+_ensure_sqlite_dir(RESOLVED_DATABASE_URL)
 
 target_metadata = Base.metadata
 

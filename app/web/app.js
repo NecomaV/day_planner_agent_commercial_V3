@@ -1,4 +1,4 @@
-'use strict';
+﻿'use strict';
 
 const apiKeyInput = document.getElementById('apiKey');
 const serviceKeyInput = document.getElementById('serviceKey');
@@ -6,7 +6,9 @@ const loadWeekButton = document.getElementById('loadWeek');
 const prevWeekButton = document.getElementById('prevWeek');
 const nextWeekButton = document.getElementById('nextWeek');
 const weekLabel = document.getElementById('weekLabel');
-const weekGrid = document.getElementById('weekGrid');
+const weekTabs = document.getElementById('weekTabs');
+const dayTitle = document.getElementById('dayTitle');
+const dayList = document.getElementById('dayList');
 const backlogList = document.getElementById('backlogList');
 const backlogSection = document.getElementById('backlogSection');
 const statusEl = document.getElementById('status');
@@ -28,15 +30,25 @@ const resetFiltersButton = document.getElementById('resetFilters');
 
 const DATE_FMT = new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: 'short' });
 const DAY_FMT = new Intl.DateTimeFormat('ru-RU', { weekday: 'short', day: '2-digit', month: 'short' });
+const DAY_FULL_FMT = new Intl.DateTimeFormat('ru-RU', { weekday: 'long', day: '2-digit', month: 'long' });
 const TIME_FMT = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' });
 
 let weekStart = startOfWeek(new Date());
+let currentWeekDays = [];
+let weekData = new Map();
+let backlogData = [];
 const taskIndex = new Map();
 let selectedTaskId = null;
 let selectedTaskElement = null;
-let currentWeekDays = [];
-let cachedDayTasks = [];
-let cachedBacklog = [];
+let activeDayKey = null;
+let loadWeekTimer = null;
+let currentRequest = null;
+let lastWeekKey = null;
+const dragState = {
+  draggingId: null,
+  placeholder: null,
+  element: null,
+};
 
 function setStatus(message, isError = false) {
   statusEl.textContent = message || '';
@@ -100,16 +112,33 @@ function applyFilters() {
     return;
   }
   const filters = getFilterState();
-  const filteredDays = cachedDayTasks.map((tasks) => tasks.filter((task) => taskMatchesFilters(task, filters)));
-  const filteredBacklog = cachedBacklog.filter((task) => taskMatchesFilters(task, filters));
+  const filteredWeek = new Map();
   taskIndex.clear();
-  renderWeek(currentWeekDays, filteredDays);
+
+  currentWeekDays.forEach((day) => {
+    const key = isoDate(day);
+    const tasks = weekData.get(key) || [];
+    tasks.forEach(registerTask);
+    const filtered = tasks.filter((task) => taskMatchesFilters(task, filters));
+    filteredWeek.set(key, filtered);
+  });
+
+  backlogData.forEach(registerTask);
+  const filteredBacklog = backlogData.filter((task) => taskMatchesFilters(task, filters));
+
+  renderWeekTabs(currentWeekDays, filteredWeek);
+  if (!activeDayKey || !filteredWeek.has(activeDayKey)) {
+    activeDayKey = currentWeekDays.length ? isoDate(currentWeekDays[0]) : null;
+  }
+  renderDayList(activeDayKey, filteredWeek.get(activeDayKey) || []);
+
   if (filters.showBacklog) {
     backlogSection.style.display = '';
     renderBacklog(filteredBacklog);
   } else {
     backlogSection.style.display = 'none';
   }
+
   restoreSelection();
 }
 
@@ -159,15 +188,15 @@ function updateSelectedTaskInfo(task) {
   if (task.planned_start) {
     const start = new Date(task.planned_start);
     const label = `${DATE_FMT.format(start)} ${TIME_FMT.format(start)}`;
-    parts.push(`запланировано: ${label}`);
+    parts.push(`Запланировано: ${label}`);
   } else if (task.due_at) {
     const due = new Date(task.due_at);
-    parts.push(`дедлайн: ${DATE_FMT.format(due)}`);
+    parts.push(`Срок: ${DATE_FMT.format(due)}`);
   } else {
-    parts.push('без времени');
+    parts.push('В бэклоге без даты');
   }
   if (task.is_done) {
-    parts.push('статус: выполнено');
+    parts.push('Статус: выполнено');
   }
   selectedTaskInfo.textContent = parts.join('\n');
 }
@@ -215,6 +244,13 @@ function parseLocalDateTime(dateValue, timeValue) {
   if (!year || !month || !day) return null;
   if (Number.isNaN(hour) || Number.isNaN(minute)) return null;
   return new Date(year, month - 1, day, hour, minute, 0, 0);
+}
+
+function parseDateKey(dateValue) {
+  if (!dateValue) return null;
+  const [year, month, day] = dateValue.split('-').map(Number);
+  if (!year || !month || !day) return null;
+  return new Date(year, month - 1, day, 0, 0, 0, 0);
 }
 
 function toLocalIsoString(dateObj) {
@@ -276,11 +312,10 @@ function buildHeaders() {
   return headers;
 }
 
-
-async function fetchJson(url, headers) {
-  const response = await fetch(url, { headers });
+async function requestJson(url, options) {
+  const response = await fetch(url, options);
   if (!response.ok) {
-    let detail = response.statusText || 'Запрос не выполнен';
+    let detail = response.statusText || 'Ошибка запроса';
     try {
       const body = await response.json();
       if (body && body.detail) {
@@ -289,8 +324,12 @@ async function fetchJson(url, headers) {
     } catch (err) {
       // ignore parse errors
     }
-    throw new Error(`${detail} (${response.status})`);
+    const error = new Error(detail);
+    error.status = response.status;
+    error.retryAfter = response.headers.get('Retry-After');
+    throw error;
   }
+  if (response.status === 204) return null;
   return response.json();
 }
 
@@ -298,7 +337,7 @@ function registerTask(task) {
   taskIndex.set(String(task.id), task);
 }
 
-function handleDragStart(event, taskId) {
+function handleDragStart(event, taskId, element) {
   event.dataTransfer.effectAllowed = 'move';
   event.dataTransfer.setData('text/plain', String(taskId));
   try {
@@ -306,11 +345,41 @@ function handleDragStart(event, taskId) {
   } catch (err) {
     // ignore
   }
+  dragState.draggingId = String(taskId);
+  dragState.element = element;
+  if (element) {
+    element.classList.add('dragging');
+    const placeholder = document.createElement('div');
+    placeholder.className = 'task-placeholder';
+    placeholder.style.height = `${element.getBoundingClientRect().height}px`;
+    element.after(placeholder);
+    requestAnimationFrame(() => {
+      element.style.visibility = 'hidden';
+    });
+    dragState.placeholder = placeholder;
+  }
+}
+
+function handleDragEnd() {
+  if (dragState.element) {
+    dragState.element.classList.remove('dragging');
+    dragState.element.style.visibility = '';
+  }
+  if (dragState.placeholder) {
+    dragState.placeholder.remove();
+  }
+  dragState.draggingId = null;
+  dragState.placeholder = null;
+  dragState.element = null;
+}
+
+function getDraggedTaskId(event) {
+  return event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
 }
 
 async function handleDropOnDay(event, dateStr) {
   event.preventDefault();
-  const taskId = event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
+  const taskId = getDraggedTaskId(event);
   if (!taskId) return;
   const task = taskIndex.get(String(taskId));
   if (!task) return;
@@ -329,7 +398,7 @@ async function handleDropOnDay(event, dateStr) {
   const duration = getTaskDurationMinutes(task);
   const end = new Date(start.getTime() + duration * 60000);
 
-  await runAction('Перемещаю задачу', async () => {
+  await runAction('Переносим задачу', async () => {
     await patchTask(task.id, {
       planned_start: toLocalIsoString(start),
       planned_end: toLocalIsoString(end),
@@ -338,19 +407,44 @@ async function handleDropOnDay(event, dateStr) {
   });
 }
 
-async function handleDropOnSlot(event, dateStr, timeStr) {
+async function handleDropOnTask(event, targetTaskId) {
   event.preventDefault();
-  const taskId = event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
-  if (!taskId) return;
+  const taskId = getDraggedTaskId(event);
+  if (!taskId || taskId === String(targetTaskId)) return;
   const task = taskIndex.get(String(taskId));
-  if (!task) return;
-  const start = parseLocalDateTime(dateStr, timeStr);
-  if (!start) return;
+  const target = taskIndex.get(String(targetTaskId));
+  if (!task || !target || !target.planned_start) return;
+
+  const targetStart = new Date(target.planned_start);
+  const targetEnd = target.planned_end
+    ? new Date(target.planned_end)
+    : new Date(targetStart.getTime() + getTaskDurationMinutes(target) * 60000);
+
+  if (task.planned_start && task.planned_end) {
+    const taskStart = new Date(task.planned_start);
+    const taskEnd = new Date(task.planned_end);
+    if (isoDate(taskStart) === isoDate(targetStart)) {
+      await runAction('Меняем время задач', async () => {
+        await patchTask(task.id, {
+          planned_start: toLocalIsoString(targetStart),
+          planned_end: toLocalIsoString(targetEnd || targetStart),
+          schedule_source: 'manual',
+        });
+        await patchTask(target.id, {
+          planned_start: toLocalIsoString(taskStart),
+          planned_end: toLocalIsoString(taskEnd),
+          schedule_source: 'manual',
+        });
+      });
+      return;
+    }
+  }
+
   const duration = getTaskDurationMinutes(task);
-  const end = new Date(start.getTime() + duration * 60000);
-  await runAction('Перемещаю задачу', async () => {
+  const end = new Date(targetStart.getTime() + duration * 60000);
+  await runAction('Переносим задачу', async () => {
     await patchTask(task.id, {
-      planned_start: toLocalIsoString(start),
+      planned_start: toLocalIsoString(targetStart),
       planned_end: toLocalIsoString(end),
       schedule_source: 'manual',
     });
@@ -359,11 +453,11 @@ async function handleDropOnSlot(event, dateStr, timeStr) {
 
 async function handleDropOnBacklog(event) {
   event.preventDefault();
-  const taskId = event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
+  const taskId = getDraggedTaskId(event);
   if (!taskId) return;
   const task = taskIndex.get(String(taskId));
   if (!task || !task.planned_start) return;
-  await runAction('Перемещаю в бэклог', async () => {
+  await runAction('Снимаем с плана', async () => {
     await patchTask(task.id, { planned_start: null, planned_end: null, schedule_source: 'manual' });
   });
 }
@@ -382,12 +476,12 @@ function createPriorityElement(task) {
   pill.type = 'button';
   pill.dataset.priority = String(task.priority || 2);
   pill.textContent = `P${task.priority || 2}`;
-  pill.title = 'Нажмите, чтобы сменить приоритет';
+  pill.title = 'Приоритет: кликните, чтобы сменить';
   pill.addEventListener('click', async (event) => {
     event.stopPropagation();
     const current = task.priority || 2;
     const next = current >= 3 ? 1 : current + 1;
-    await runAction('Обновляю приоритет', async () => {
+    await runAction('Обновляем приоритет', async () => {
       await patchTask(task.id, { priority: next });
     });
   });
@@ -397,7 +491,7 @@ function createPriorityElement(task) {
 function createNotesElement(task, item) {
   const notes = document.createElement('div');
   notes.className = 'task-notes';
-  notes.textContent = task.notes ? `Заметка: ${task.notes}` : 'Добавить заметку';
+  notes.textContent = task.notes ? `Заметки: ${task.notes}` : 'Добавьте заметку';
   if (!task.notes) {
     notes.classList.add('empty');
   }
@@ -424,7 +518,18 @@ function renderTask(task, dayDateStr = null) {
   }
   item.addEventListener('click', () => setSelectedTask(task, item));
   item.setAttribute('draggable', 'true');
-  item.addEventListener('dragstart', (event) => handleDragStart(event, task.id));
+  item.addEventListener('dragstart', (event) => handleDragStart(event, task.id, item));
+  item.addEventListener('dragend', () => handleDragEnd());
+  item.addEventListener('dragover', (event) => {
+    event.preventDefault();
+    item.classList.add('drag-over');
+  });
+  item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+  item.addEventListener('drop', async (event) => {
+    item.classList.remove('drag-over');
+    await handleDropOnTask(event, task.id);
+  });
+
   const timeLabel = formatTimeRange(task);
   if (timeLabel) {
     item.appendChild(createTimeElement(task, item));
@@ -474,7 +579,7 @@ function startTitleEdit(task, item, titleEl) {
     if (!save || !newTitle || newTitle === task.title) {
       return;
     }
-    await runAction('Сохраняю название', async () => {
+    await runAction('Сохраняем название', async () => {
       await patchTask(task.id, { title: newTitle });
     });
   };
@@ -520,7 +625,7 @@ function startTimeEdit(task, item, timeEl) {
     if (!start) return;
     const duration = getTaskDurationMinutes(task);
     const end = new Date(start.getTime() + duration * 60000);
-    await runAction('Сохраняю время', async () => {
+    await runAction('Обновляем время', async () => {
       await patchTask(task.id, {
         planned_start: toLocalIsoString(start),
         planned_end: toLocalIsoString(end),
@@ -561,7 +666,7 @@ function startNotesEdit(task, item, notesEl) {
     if ((task.notes || null) === nextNotes) {
       return;
     }
-    await runAction('Сохраняю заметку', async () => {
+    await runAction('Сохраняем заметку', async () => {
       await patchTask(task.id, { notes: nextNotes });
     });
   };
@@ -579,100 +684,74 @@ function startNotesEdit(task, item, notesEl) {
   });
 }
 
-function buildTimeSlots() {
-  const slots = [];
-  for (let hour = 0; hour < 24; hour += 1) {
-    slots.push({ hour, minute: 0 });
-    slots.push({ hour, minute: 30 });
-  }
-  return slots;
-}
-
-function slotKeyFromDate(dateObj) {
-  const hour = dateObj.getHours();
-  const minute = dateObj.getMinutes() < 30 ? 0 : 30;
-  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-}
-
-function renderWeek(days, dayTasks) {
-  weekGrid.innerHTML = '';
-  const slots = buildTimeSlots();
-  days.forEach((day, idx) => {
-    const card = document.createElement('div');
-    card.className = 'day-card';
-    const dayStr = isoDate(day);
-    card.dataset.date = dayStr;
-    card.addEventListener('dragover', (event) => {
-      event.preventDefault();
-      card.classList.add('drag-over');
-    });
-    card.addEventListener('dragleave', () => card.classList.remove('drag-over'));
-    card.addEventListener('drop', async (event) => {
-      card.classList.remove('drag-over');
-      await handleDropOnDay(event, dayStr);
-    });
-    const heading = document.createElement('h3');
-    heading.textContent = DAY_FMT.format(day);
-    card.appendChild(heading);
-    const tasks = dayTasks[idx] || [];
-    const timeline = document.createElement('div');
-    timeline.className = 'day-timeline';
-    const buckets = new Map();
-    tasks.forEach((task) => {
-      registerTask(task);
-      if (!task.planned_start) {
-        return;
-      }
-      const start = new Date(task.planned_start);
-      const key = slotKeyFromDate(start);
-      const list = buckets.get(key) || [];
-      list.push(task);
-      buckets.set(key, list);
-    });
-
-    slots.forEach((slot) => {
-      const timeStr = formatTimeInput(slot.hour, slot.minute);
-      const row = document.createElement('div');
-      row.className = 'time-slot';
-      const label = document.createElement('div');
-      label.className = 'time-label';
-      label.textContent = timeStr;
-      const drop = document.createElement('div');
-      drop.className = 'time-drop';
-      drop.addEventListener('dragover', (event) => {
-        event.preventDefault();
-        drop.classList.add('drag-over');
-      });
-      drop.addEventListener('dragleave', () => drop.classList.remove('drag-over'));
-      drop.addEventListener('drop', async (event) => {
-        drop.classList.remove('drag-over');
-        await handleDropOnSlot(event, dayStr, timeStr);
-      });
-      const slotTasks = buckets.get(timeStr) || [];
-      slotTasks.forEach((task) => {
-        drop.appendChild(renderTask(task, dayStr));
-      });
-      row.appendChild(label);
-      row.appendChild(drop);
-      timeline.appendChild(row);
-    });
-
-    if (!tasks.length) {
-      const empty = document.createElement('div');
-      empty.className = 'backlog-meta';
-      empty.textContent = 'Нет запланированных задач.';
-      timeline.appendChild(empty);
+function renderWeekTabs(days, filteredWeek) {
+  weekTabs.innerHTML = '';
+  days.forEach((day) => {
+    const key = isoDate(day);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'week-tab';
+    if (key === activeDayKey) {
+      btn.classList.add('active');
     }
-
-    card.appendChild(timeline);
-    weekGrid.appendChild(card);
+    const label = document.createElement('div');
+    label.textContent = DAY_FMT.format(day);
+    const count = document.createElement('div');
+    count.className = 'count';
+    const tasks = filteredWeek.get(key) || [];
+    count.textContent = tasks.length ? `${tasks.length} задач` : 'Пусто';
+    btn.appendChild(label);
+    btn.appendChild(count);
+    btn.addEventListener('click', () => {
+      activeDayKey = key;
+      applyFilters();
+    });
+    btn.addEventListener('dragover', (event) => {
+      event.preventDefault();
+      btn.classList.add('drag-over');
+    });
+    btn.addEventListener('dragleave', () => btn.classList.remove('drag-over'));
+    btn.addEventListener('drop', async (event) => {
+      btn.classList.remove('drag-over');
+      await handleDropOnDay(event, key);
+    });
+    weekTabs.appendChild(btn);
   });
+}
+
+function renderDayList(dayKey, tasks) {
+  dayList.innerHTML = '';
+  if (!dayKey) {
+    dayTitle.textContent = '';
+    return;
+  }
+  const dayDate = parseDateKey(dayKey) || new Date(dayKey);
+  dayTitle.textContent = DAY_FULL_FMT.format(dayDate);
+  if (!tasks.length) {
+    const empty = document.createElement('div');
+    empty.className = 'day-empty';
+    empty.textContent = 'На этот день задач нет.';
+    dayList.appendChild(empty);
+  } else {
+    tasks.forEach((task) => {
+      dayList.appendChild(renderTask(task, dayKey));
+    });
+  }
+  dayList.ondragover = (event) => {
+    event.preventDefault();
+    dayList.classList.add('drag-over');
+  };
+  dayList.ondragleave = () => dayList.classList.remove('drag-over');
+  dayList.ondrop = async (event) => {
+    dayList.classList.remove('drag-over');
+    await handleDropOnDay(event, dayKey);
+  };
 }
 
 function renderBacklog(backlog) {
   backlogList.innerHTML = '';
   if (!backlog.length) {
-    backlogList.textContent = 'Бэклог пуст.';
+    backlogList.textContent = 'Пока пусто.';
     return;
   }
   backlog.forEach((task) => {
@@ -682,7 +761,8 @@ function renderBacklog(backlog) {
     item.dataset.taskId = String(task.id);
     item.addEventListener('click', () => setSelectedTask(task, item));
     item.setAttribute('draggable', 'true');
-    item.addEventListener('dragstart', (event) => handleDragStart(event, task.id));
+    item.addEventListener('dragstart', (event) => handleDragStart(event, task.id, item));
+    item.addEventListener('dragend', () => handleDragEnd());
     const title = createTitleElement(task, item);
     item.appendChild(title);
     const meta = document.createElement('div');
@@ -693,7 +773,7 @@ function renderBacklog(backlog) {
     const metaParts = [];
     if (task.due_at) {
       const due = new Date(task.due_at);
-      metaParts.push(`Срок ${DATE_FMT.format(due)}`);
+      metaParts.push(`Срок: ${DATE_FMT.format(due)}`);
     }
     if (task.estimate_minutes) {
       metaParts.push(`${task.estimate_minutes} мин`);
@@ -713,13 +793,13 @@ function restoreSelection() {
     setActionButtonsEnabled(false);
     return;
   }
-  const task = taskIndex.get(String(selectedTaskId));
-  if (!task) {
+  const element = document.querySelector(`[data-task-id="${selectedTaskId}"]`);
+  if (!element) {
     clearSelection();
     return;
   }
-  const element = document.querySelector(`[data-task-id="${selectedTaskId}"]`);
-  if (!element) {
+  const task = taskIndex.get(String(selectedTaskId));
+  if (!task) {
     clearSelection();
     return;
   }
@@ -738,7 +818,6 @@ function saveAuth() {
   }
 }
 
-
 function loadAuth() {
   try {
     const raw = localStorage.getItem('dpCabinetAuth');
@@ -751,48 +830,34 @@ function loadAuth() {
   }
 }
 
-
 async function patchTask(taskId, payload) {
   const headers = buildHeaders();
   headers['Content-Type'] = 'application/json';
-  const response = await fetch(`/tasks/${taskId}`, {
+  return requestJson(`/tasks/${taskId}`, {
     method: 'PATCH',
     headers,
     body: JSON.stringify(payload),
   });
-  if (!response.ok) {
-    let detail = response.statusText || 'Запрос не выполнен';
-    try {
-      const body = await response.json();
-      if (body && body.detail) detail = body.detail;
-    } catch (err) {
-      // ignore
-    }
-    throw new Error(`${detail} (${response.status})`);
-  }
-  return response.json();
 }
 
 async function deleteTask(taskId) {
   const headers = buildHeaders();
-  const response = await fetch(`/tasks/${taskId}`, {
+  return requestJson(`/tasks/${taskId}`, {
     method: 'DELETE',
     headers,
   });
-  if (!response.ok) {
-    let detail = response.statusText || 'Запрос не выполнен';
-    try {
-      const body = await response.json();
-      if (body && body.detail) detail = body.detail;
-    } catch (err) {
-      // ignore
-    }
-    throw new Error(`${detail} (${response.status})`);
-  }
-  return response.json();
 }
 
-async function loadWeek() {
+function scheduleLoadWeek(force = false) {
+  if (loadWeekTimer) {
+    clearTimeout(loadWeekTimer);
+  }
+  loadWeekTimer = setTimeout(() => {
+    loadWeek({ force });
+  }, 250);
+}
+
+async function loadWeek({ force = false } = {}) {
   let headers;
   try {
     headers = buildHeaders();
@@ -802,25 +867,62 @@ async function loadWeek() {
   }
 
   saveAuth();
-  setStatus('Загружаю...');
+  setStatus('Загружаем неделю...');
 
   const days = weekDays(weekStart);
+  const startKey = isoDate(days[0]);
   weekLabel.textContent = formatWeekLabel(days);
-  weekGrid.innerHTML = '';
-  backlogList.textContent = 'Загружаю...';
+
+  if (!force && lastWeekKey === startKey && weekData.size) {
+    currentWeekDays = days;
+    applyFilters();
+    setStatus('Неделя уже загружена.');
+    return;
+  }
+
+  if (currentRequest) {
+    currentRequest.abort();
+  }
+  const controller = new AbortController();
+  currentRequest = controller;
 
   try {
-    const dayRequests = days.map((day) => fetchJson(`/tasks/day?date=${isoDate(day)}`, headers));
-    const backlogRequest = fetchJson('/tasks/backlog', headers);
-    const [dayTasks, backlog] = await Promise.all([Promise.all(dayRequests), backlogRequest]);
+    const data = await requestJson(`/tasks/plan/week?start=${startKey}`, {
+      headers,
+      signal: controller.signal,
+    });
+
     currentWeekDays = days;
-    cachedDayTasks = dayTasks;
-    cachedBacklog = backlog;
+    weekData = new Map();
+    backlogData = Array.isArray(data.backlog) ? data.backlog : [];
+
+    const dayKeys = days.map((day) => isoDate(day));
+    dayKeys.forEach((key) => {
+      const tasks = (data.days && data.days[key]) || [];
+      weekData.set(key, tasks);
+    });
+
+    if (activeDayKey && dayKeys.includes(activeDayKey)) {
+      // keep current
+    } else {
+      const todayKey = isoDate(new Date());
+      activeDayKey = dayKeys.includes(todayKey) ? todayKey : dayKeys[0];
+    }
+
+    lastWeekKey = startKey;
     applyFilters();
-    const total = dayTasks.reduce((sum, list) => sum + list.length, 0);
-    setStatus(`Загружено задач: ${total}.`);
+    const total = dayKeys.reduce((sum, key) => sum + (weekData.get(key)?.length || 0), 0);
+    setStatus(`Неделя загружена: ${total} задач.`);
   } catch (err) {
-    setStatus(err.message || 'Не удалось загрузить данные.', true);
+    if (err.name === 'AbortError') {
+      return;
+    }
+    let message = err.message || 'Не удалось загрузить данные.';
+    if (err.status === 429) {
+      const retry = err.retryAfter ? ` Подождите ${err.retryAfter} сек.` : '';
+      message = `Слишком много запросов.${retry}`;
+    }
+    setStatus(message, true);
     backlogList.textContent = 'Не удалось загрузить бэклог.';
   }
 }
@@ -834,10 +936,15 @@ async function runAction(label, action) {
   setStatus(`${label}...`);
   try {
     await action();
-    await loadWeek();
-    setStatus(`${label} готово.`);
+    await loadWeek({ force: true });
+    setStatus(`${label} выполнено.`);
   } catch (err) {
-    setStatus(err.message || 'Ошибка действия.', true);
+    let message = err.message || 'Не удалось выполнить действие.';
+    if (err.status === 429) {
+      const retry = err.retryAfter ? ` Подождите ${err.retryAfter} сек.` : '';
+      message = `Слишком много запросов.${retry}`;
+    }
+    setStatus(message, true);
   }
 }
 
@@ -848,7 +955,7 @@ async function handleMarkDone() {
     return;
   }
   const nextDone = !task.is_done;
-  const label = nextDone ? 'Отмечаю выполненной' : 'Возвращаю в работу';
+  const label = nextDone ? 'Отмечаем выполненной' : 'Возвращаем в работу';
   await runAction(label, async () => {
     await patchTask(task.id, { is_done: nextDone });
   });
@@ -863,7 +970,7 @@ async function handleDelete() {
   if (!window.confirm(`Удалить задачу "${task.title}"?`)) {
     return;
   }
-  await runAction('Удаляю задачу', async () => {
+  await runAction('Удаляем задачу', async () => {
     await deleteTask(task.id);
     clearSelection();
   });
@@ -875,7 +982,7 @@ async function handleUnschedule() {
     setStatus('Сначала выберите задачу.', true);
     return;
   }
-  await runAction('Перемещаю в бэклог', async () => {
+  await runAction('Снимаем с плана', async () => {
     await patchTask(task.id, { planned_start: null, planned_end: null, schedule_source: 'manual' });
   });
 }
@@ -889,17 +996,17 @@ async function handleMove() {
   const dateValue = moveDateInput.value;
   const timeValue = moveTimeInput.value;
   if (!dateValue || !timeValue) {
-    setStatus('Укажите дату и время.', true);
+    setStatus('Введите дату и время.', true);
     return;
   }
   const start = parseLocalDateTime(dateValue, timeValue);
   if (!start) {
-    setStatus('Неверная дата или время.', true);
+    setStatus('Не удалось распознать дату и время.', true);
     return;
   }
   const minutes = parseInt(moveMinutesInput.value, 10) || getTaskDurationMinutes(task);
   const end = new Date(start.getTime() + minutes * 60000);
-  await runAction('Переношу задачу', async () => {
+  await runAction('Перемещаем задачу', async () => {
     await patchTask(task.id, {
       planned_start: toLocalIsoString(start),
       planned_end: toLocalIsoString(end),
@@ -908,14 +1015,14 @@ async function handleMove() {
   });
 }
 
-loadWeekButton.addEventListener('click', loadWeek);
+loadWeekButton.addEventListener('click', () => loadWeek({ force: true }));
 prevWeekButton.addEventListener('click', () => {
   weekStart = addDays(weekStart, -7);
-  loadWeek();
+  scheduleLoadWeek(true);
 });
 nextWeekButton.addEventListener('click', () => {
   weekStart = addDays(weekStart, 7);
-  loadWeek();
+  scheduleLoadWeek(true);
 });
 
 loadAuth();
@@ -959,6 +1066,8 @@ backlogList.addEventListener('drop', async (event) => {
 });
 
 setActionButtonsEnabled(false);
+
+loadWeek({ force: true });
 
 document.addEventListener('keydown', (event) => {
   if (!selectedTaskId) return;

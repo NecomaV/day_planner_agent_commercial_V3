@@ -2,6 +2,11 @@ import re
 
 
 def _extract_task_ids(text: str) -> list[int]:
+    ids: list[int] = []
+    for m in re.finditer(r"(?:\b(?:id|ид)\s*[:#=]?\s*|[#№])(\d+)", text, flags=re.IGNORECASE):
+        ids.append(int(m.group(1)))
+    if ids:
+        return list(dict.fromkeys(ids))
     return [int(x) for x in re.findall(r"\b\d+\b", text)]
 
 

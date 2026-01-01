@@ -11,6 +11,7 @@ from app.api.routers.routine import router as routine_router
 from app.api.routers.autoplan import router as autoplan_router
 from app.api.routers.health import router as health_router
 from app.api.routers.habits import router as habits_router
+from app.api.routers.debug import router as debug_router
 from app.logging_utils import RedactFilter
 
 
@@ -26,6 +27,7 @@ def create_app() -> FastAPI:
     app.include_router(profile_router)
     app.include_router(health_router)
     app.include_router(habits_router)
+    app.include_router(debug_router)
 
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next):

@@ -347,6 +347,39 @@ def update_task_fields(db: Session, user_id: int, task_id: int, **fields) -> Tas
     return task
 
 
+def reschedule_task(
+    db: Session,
+    user_id: int,
+    *,
+    task_id: int,
+    target_date: dt.date,
+    target_time: dt.time,
+    duration_min: int | None = None,
+    schedule_source: str = "manual",
+) -> Task | None:
+    task = get_task(db, user_id, task_id)
+    if not task:
+        return None
+    if duration_min is None:
+        if task.planned_start and task.planned_end:
+            duration_min = int((task.planned_end - task.planned_start).total_seconds() // 60)
+        else:
+            duration_min = int(task.estimate_minutes or 30)
+    if duration_min <= 0:
+        duration_min = int(task.estimate_minutes or 30)
+
+    start = dt.datetime.combine(target_date, target_time)
+    end = start + dt.timedelta(minutes=duration_min)
+    return update_task_fields(
+        db,
+        user_id,
+        task_id,
+        planned_start=start,
+        planned_end=end,
+        schedule_source=schedule_source,
+    )
+
+
 def delete_task(db: Session, user_id: int, task_id: int) -> bool:
     task = db.execute(select(Task).where(and_(Task.id == task_id, Task.user_id == user_id))).scalar_one_or_none()
     if not task:
@@ -415,6 +448,23 @@ def list_scheduled_for_day(db: Session, user_id: int, day: dt.date) -> list[Task
         ).scalars()
     )
 
+
+def list_scheduled_for_range(db: Session, user_id: int, start_day: dt.date, end_day: dt.date) -> list[Task]:
+    start = dt.datetime.combine(start_day, dt.time.min)
+    end = dt.datetime.combine(end_day, dt.time.min)
+    return list(
+        db.execute(
+            select(Task)
+            .where(
+                and_(
+                    Task.user_id == user_id,
+                    Task.planned_start >= start,
+                    Task.planned_start < end,
+                )
+            )
+            .order_by(Task.planned_start.asc(), Task.id.asc())
+        ).scalars()
+    )
 
 def list_backlog(db: Session, user_id: int) -> list[Task]:
     return list(

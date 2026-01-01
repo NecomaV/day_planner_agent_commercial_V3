@@ -6,6 +6,7 @@ from app.bot.context import get_db_session, get_user
 from app.bot.handlers.routine import start_onboarding
 from app.bot.rendering.account import cabinet_message, me_message, token_message
 from app.bot.rendering.help import start_help_message
+from app.debug_info import build_db_debug
 from app.i18n.core import locale_for_user, t
 from app.settings import settings
 
@@ -112,3 +113,40 @@ async def cmd_lang(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             t("lang.set", locale=value, lang=value)
         )
+
+
+async def cmd_debug_db(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    with get_db_session() as db:
+        user = await get_user(update, db)
+        locale = locale_for_user(user)
+        info = build_db_debug(db, user.id)
+
+    lines = [t("debug.db.header", locale=locale)]
+    labels = {
+        "dialect": t("debug.db.dialect", locale=locale),
+        "cwd": t("debug.db.cwd", locale=locale),
+        "sqlite_path": t("debug.db.path", locale=locale),
+        "exists": t("debug.db.exists", locale=locale),
+        "size_bytes": t("debug.db.size", locale=locale),
+        "mtime": t("debug.db.mtime", locale=locale),
+        "user_id": t("debug.db.user_id", locale=locale),
+        "tasks_total": t("debug.db.tasks_total", locale=locale),
+        "tasks_backlog": t("debug.db.tasks_backlog", locale=locale),
+        "reminders_due": t("debug.db.reminders_due", locale=locale),
+    }
+    for key in [
+        "dialect",
+        "cwd",
+        "sqlite_path",
+        "exists",
+        "size_bytes",
+        "mtime",
+        "user_id",
+        "tasks_total",
+        "tasks_backlog",
+        "reminders_due",
+    ]:
+        if key in info:
+            lines.append(t("debug.db.kv", locale=locale, label=labels[key], value=info[key]))
+
+    await update.message.reply_text("\n".join(lines))

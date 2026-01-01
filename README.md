@@ -36,11 +36,15 @@ cp .env.example .env
 - `REMINDER_LEAD_MIN` controls how many minutes before a task starts a reminder is sent.
 - `CALL_FOLLOWUP_DAYS` controls default follow-up delay for `/call`.
 - `OPENAI_API_KEY` enables optional voice transcription and AI intent parsing.
-- `OPENAI_TRANSCRIBE_MODEL` controls the speech-to-text model (default `whisper-1`).
+- `OPENAI_TRANSCRIBE_MODEL` controls the speech-to-text model (default `gpt-4o-mini-transcribe`).
 - `OPENAI_CHAT_MODEL` controls the AI model for intent parsing (default `gpt-4o-mini`).
 - `OPENAI_TRANSCRIBE_LANGUAGE` hints transcription language (default `ru`).
+- `APP_DATA_DIR` lets you set a single absolute base directory for SQLite data (recommended for multi-process).
+- For SQLite, prefer an absolute path (e.g. `sqlite:///C:/Projects/.../data/planner.db`) to avoid DB desync.
+- SQLite WAL mode is enabled automatically for multi-process reliability.
 - `AI_*` caps control daily quotas and request limits for AI usage.
 - `API_RATE_*` and `AUTH_*` control API rate limiting and abuse protection.
+- `API_RATE_LIMIT_READ_PER_MIN` controls read-only endpoint throughput (week view, backlog).
 - `BOT_*` controls Telegram throttling and dedupe behavior.
 - `REDIS_URL` enables shared rate limiting across multiple API instances (optional).
 
@@ -74,6 +78,15 @@ python run_telegram_bot.py
 ```bash
 python -m app.worker
 ```
+
+## Web cabinet performance
+- Week view uses a single bulk endpoint: `GET /tasks/plan/week?start=YYYY-MM-DD`.
+- Avoid polling or multiple day requests to prevent rate limits.
+
+## Troubleshooting 429 (Too Many Requests)
+- Wait for the `Retry-After` seconds shown in the response/UI.
+- Ensure the web cabinet is calling `/tasks/plan/week` once per week load.
+- If needed, increase `API_RATE_LIMIT_READ_PER_MIN` in `.env`.
 
 ## Token rotation
 - Run `/token` in Telegram to rotate your API token.
@@ -120,6 +133,14 @@ docker compose up --build
 1) Add or edit a key in `app/i18n/ru.json` (Russian is default).
 2) Optionally add the English fallback in `app/i18n/en.json`.
 3) Use `t("key", locale=locale, **vars)` in bot handlers/rendering.
+
+## Verification checklist
+1) Run `python -m scripts.init_db` and start API + bot + worker.
+2) In Telegram, create a task and open `/debug_db` to confirm a single SQLite path.
+3) In web cabinet, load a week and ensure the UI responds without 429 errors.
+4) Drag a task within the active day list and confirm the time changes.
+5) Say in Telegram: “Покажи задачи на 6 января” → a real plan, not a refusal.
+6) Say: “Перенеси ID 23 на 7 вечера сегодня” → task moves to 19:00 today.
 
 ## Key concepts implemented
 

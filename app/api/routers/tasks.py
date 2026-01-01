@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.db import get_db
-from app.api.deps import get_current_user, require_api_key
-from app.schemas.tasks import TaskCreate, TaskOut, TaskUpdate, PlanOut, TaskLocationIn
+from app.api.deps import get_current_user, get_current_user_read, require_api_key
+from app.schemas.tasks import TaskCreate, TaskOut, TaskUpdate, PlanOut, WeekPlanOut, TaskLocationIn
 from app import crud
 
 router = APIRouter(prefix="/tasks", tags=["tasks"], dependencies=[Depends(require_api_key)])
@@ -22,13 +22,13 @@ def create_task(payload: TaskCreate, db: Session = Depends(get_db), user=Depends
 def list_day(
     date: dt.date = Query(..., description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_read),
 ):
     return crud.list_scheduled_for_day(db, user.id, date)
 
 
 @router.get("/backlog", response_model=list[TaskOut])
-def list_backlog(db: Session = Depends(get_db), user=Depends(get_current_user)):
+def list_backlog(db: Session = Depends(get_db), user=Depends(get_current_user_read)):
     return crud.list_backlog(db, user.id)
 
 
@@ -36,11 +36,31 @@ def list_backlog(db: Session = Depends(get_db), user=Depends(get_current_user)):
 def get_plan(
     date: dt.date = Query(..., description="YYYY-MM-DD"),
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user=Depends(get_current_user_read),
 ):
     scheduled = crud.list_scheduled_for_day(db, user.id, date)
     backlog = crud.list_backlog(db, user.id)
     return PlanOut(date=date.isoformat(), scheduled=scheduled, backlog=backlog)
+
+
+@router.get("/plan/week", response_model=WeekPlanOut)
+def get_week_plan(
+    start: dt.date = Query(..., description="YYYY-MM-DD (week start)"),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user_read),
+):
+    end = start + dt.timedelta(days=7)
+    scheduled = crud.list_scheduled_for_range(db, user.id, start, end)
+    days = { (start + dt.timedelta(days=offset)).isoformat(): [] for offset in range(7) }
+    for task in scheduled:
+        if not task.planned_start:
+            continue
+        day_key = task.planned_start.date().isoformat()
+        if day_key not in days:
+            continue
+        days[day_key].append(task)
+    backlog = crud.list_backlog(db, user.id)
+    return WeekPlanOut(start=start.isoformat(), days=days, backlog=backlog)
 
 
 @router.patch("/{task_id}", response_model=TaskOut)

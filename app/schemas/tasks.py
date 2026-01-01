@@ -131,6 +131,12 @@ class PlanOut(BaseModel):
     backlog: list[TaskOut]
 
 
+class WeekPlanOut(BaseModel):
+    start: str
+    days: dict[str, list[TaskOut]]
+    backlog: list[TaskOut]
+
+
 class TaskLocationIn(BaseModel):
     lat: float
     lon: float

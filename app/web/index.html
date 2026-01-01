@@ -18,7 +18,7 @@
         <div>
           <p class="eyebrow">Бизнес-ассистент</p>
           <h1>Кабинет ассистента</h1>
-          <p class="lead">Здесь ваши планы, быстрый доступ к расписанию и списку задач.</p>
+          <p class="lead">Планирование недели, быстрые правки задач и общий контроль.</p>
         </div>
         <div class="auth">
           <label>
@@ -35,85 +35,101 @@
         <div id="status" class="status" role="status"></div>
       </header>
 
-      <section class="controls">
-        <div class="controls-card">
-          <div class="controls-header">
-            <h2>Действия</h2>
-            <button id="clearSelection" class="ghost">Снять выбор</button>
-          </div>
-          <div id="selectedTaskInfo" class="selected-task">Выберите задачу в календаре или бэклоге.</div>
-          <div class="controls-actions">
-            <button id="markDone">Готово</button>
-            <button id="unscheduleTask" class="ghost">В бэклог</button>
-            <button id="deleteTask" class="danger">Удалить</button>
-          </div>
-          <div class="controls-move">
-            <label>
-              Дата
-              <input id="moveDate" type="date" />
-            </label>
-            <label>
-              Время
-              <input id="moveTime" type="time" />
-            </label>
-            <label>
-              Длительность, мин
-              <input id="moveMinutes" type="number" min="5" step="5" />
-            </label>
-            <button id="moveTask">Переместить</button>
-          </div>
-        </div>
-      </section>
+      <section class="layout">
+        <div class="panel-left">
+          <section class="controls">
+            <div class="controls-card">
+              <div class="controls-header">
+                <h2>Действия</h2>
+                <button id="clearSelection" class="ghost">Снять выбор</button>
+              </div>
+              <div id="selectedTaskInfo" class="selected-task">Выберите задачу в календаре или бэклоге.</div>
+              <div class="controls-actions">
+                <button id="markDone">Готово</button>
+                <button id="unscheduleTask" class="ghost">В бэклог</button>
+                <button id="deleteTask" class="danger">Удалить</button>
+              </div>
+              <div class="controls-move">
+                <label>
+                  Дата
+                  <input id="moveDate" type="date" />
+                </label>
+                <label>
+                  Время
+                  <input id="moveTime" type="time" />
+                </label>
+                <label>
+                  Длительность, мин
+                  <input id="moveMinutes" type="number" min="5" step="5" />
+                </label>
+                <button id="moveTask">Переместить</button>
+              </div>
+            </div>
+          </section>
 
-      <section class="filters">
-        <div class="filters-card">
-          <div class="filters-header">
-            <h2>Фильтры</h2>
-            <button id="resetFilters" class="ghost">Сбросить</button>
-          </div>
-          <div class="filters-row">
-            <label>
-              Поиск
-              <input id="searchInput" type="search" placeholder="задача, заметка, тег" />
-            </label>
-            <label>
-              Тип
-              <select id="kindFilter">
-                <option value="all">Все</option>
-                <option value="work">Работа</option>
-                <option value="workout">Тренировки</option>
-                <option value="meal">Еда</option>
-                <option value="morning">Утро</option>
-                <option value="other">Другое</option>
-              </select>
-            </label>
-            <label class="checkbox">
-              <input id="showDone" type="checkbox" />
-              Выполненные
-            </label>
-            <label class="checkbox">
-              <input id="showBacklog" type="checkbox" checked />
-              Показывать бэклог
-            </label>
-          </div>
-        </div>
-      </section>
+          <section class="filters">
+            <div class="filters-card">
+              <div class="filters-header">
+                <h2>Фильтры</h2>
+                <button id="resetFilters" class="ghost">Сбросить</button>
+              </div>
+              <div class="filters-row">
+                <label>
+                  Поиск
+                  <input id="searchInput" type="search" placeholder="задача, заметка, тег" />
+                </label>
+                <label>
+                  Тип
+                  <select id="kindFilter">
+                    <option value="all">Все</option>
+                    <option value="work">Работа</option>
+                    <option value="workout">Тренировки</option>
+                    <option value="meal">Еда</option>
+                    <option value="morning">Утро</option>
+                    <option value="other">Другое</option>
+                  </select>
+                </label>
+                <label class="checkbox">
+                  <input id="showDone" type="checkbox" />
+                  Выполненные
+                </label>
+                <label class="checkbox">
+                  <input id="showBacklog" type="checkbox" checked />
+                  Показывать бэклог
+                </label>
+              </div>
+            </div>
+          </section>
 
-      <section class="week">
-        <div class="week-header">
-          <h2>Неделя</h2>
-          <div class="week-controls">
-            <button id="prevWeek">&lt;</button>
-            <div id="weekLabel"></div>
-            <button id="nextWeek">&gt;</button>
-          </div>
+          <section id="backlogSection" class="backlog">
+            <h2>Бэклог</h2>
+            <div id="backlogList" class="backlog-list">Пока пусто.</div>
+          </section>
         </div>
-        <div id="weekGrid" class="week-grid"></div>
-      </section>
 
-      <section id="backlogSection" class="backlog">
-        <h2>Бэклог</h2>
-        <div id="backlogList" class="backlog-list">Пока пусто.</div>
+        <div class="panel-main">
+          <section class="week">
+            <div class="week-header">
+              <div class="week-nav">
+                <button id="prevWeek" class="ghost">&lt;</button>
+                <div>
+                  <h2>Неделя</h2>
+                  <div id="weekLabel" class="week-label"></div>
+                </div>
+                <button id="nextWeek" class="ghost">&gt;</button>
+              </div>
+              <div class="week-hint">Перетаскивайте задачи между днями или меняйте время двойным кликом.</div>
+            </div>
+            <div id="weekTabs" class="week-tabs"></div>
+            <div class="day-panel">
+              <div class="day-header">
+                <div id="dayTitle" class="day-title"></div>
+                <div class="day-subtitle">Перетаскивание внутри дня меняет время задачи.</div>
+              </div>
+              <div id="dayList" class="day-list"></div>
+            </div>
+          </section>
+        </div>
       </section>
     </main>
 

@@ -12,6 +12,7 @@ class Settings(BaseSettings):
 
     # DB
     DATABASE_URL: str = "sqlite:///./data/planner.db"
+    APP_DATA_DIR: str | None = None
 
     # App
     TZ: str = "Asia/Almaty"
@@ -23,6 +24,7 @@ class Settings(BaseSettings):
     API_KEY_SECRET: str | None = None
     REDIS_URL: str | None = None
     API_RATE_LIMIT_PER_MIN: int = 60
+    API_RATE_LIMIT_READ_PER_MIN: int = 300
     API_RATE_LIMIT_AI_PER_MIN: int = 10
     API_RATE_LIMIT_AUTH_PER_MIN_IP: int = 10
     API_RATE_WINDOW_SEC: int = 60

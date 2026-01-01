@@ -38,6 +38,7 @@ from app.services.slots import (
     parse_hhmm,
     task_display_minutes,
 )
+from app.settings import settings
 
 
 def _idempotency_key(update: Update) -> Optional[str]:
@@ -64,6 +65,11 @@ def _format_task_choice(task, routine, locale: str) -> str:
         when=when,
         minutes=mins,
     )
+
+
+def _list_open_tasks(db, user, day: dt.date):
+    tasks = crud.list_tasks_for_day(db, user.id, day)
+    return [t for t in tasks if not t.is_done]
 
 def _find_conflicts(db, user_id: int, start: dt.datetime, end: dt.datetime) -> list:
     day = start.date()
@@ -249,7 +255,16 @@ async def _apply_task_actions(action: str, task_ids: list[int], update: Update, 
     return True
 
 async def _prompt_task_selection(action: str, update: Update, context: ContextTypes.DEFAULT_TYPE, db, user, routine) -> None:
-    tasks = _list_open_tasks(db, user, routine)
+    day = None
+    raw_day = context.user_data.get("last_plan_day") if context else None
+    if raw_day:
+        try:
+            day = dt.date.fromisoformat(str(raw_day))
+        except ValueError:
+            day = None
+    if day is None:
+        day = now_local_naive().date()
+    tasks = _list_open_tasks(db, user, day)
     locale = locale_for_user(user)
     if not tasks:
         await update.message.reply_text(t("tasks.selection.empty", locale=locale))
@@ -275,6 +290,13 @@ async def _handle_pending_action(
     if not pending:
         return False
     locale = locale_for_user(user)
+    lower = text.strip().lower()
+    if lower.startswith("/"):
+        context.user_data.pop("pending_action", None)
+        return False
+    if re.search(r"\b(план|расписание|график|бэклог|беклог|backlog)\b", lower):
+        context.user_data.pop("pending_action", None)
+        return False
     flags = parse_reply(text)
     if flags.is_cancel:
         context.user_data.pop("pending_action", None)
@@ -935,6 +957,50 @@ async def cmd_capture(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         t("tasks.capture.added", locale=locale, title=task.title, when=when, checklist=checklist_info)
     )
 
+
+async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(t("call.usage", locale="ru"))
+        return
+
+    text = " ".join(context.args).strip()
+    now = now_local_naive()
+    parsed = parse_quick_task(text, now)
+
+    with get_db_session() as db:
+        user = await get_ready_user(update, context, db, start_onboarding=start_onboarding)
+        if not user:
+            return
+        locale = locale_for_user(user)
+        name = parsed.title.strip() if parsed.title else t("suggestion.followup.default_name", locale=locale)
+        due_at = parsed.due_at
+        if not due_at:
+            due_day = now.date() + dt.timedelta(days=max(0, settings.CALL_FOLLOWUP_DAYS))
+            due_at = dt.datetime.combine(due_day, dt.time(9, 0))
+
+        task = crud.create_task_fields(
+            db,
+            user.id,
+            title=t("suggestion.followup.title", locale=locale, name=name),
+            notes=None,
+            due_at=due_at,
+            priority=2,
+            estimate_minutes=15,
+            task_type="user",
+            schedule_source="assistant",
+            idempotency_key=_idempotency_key(update),
+        )
+        crud.add_checklist_items(
+            db,
+            task.id,
+            [t("suggestion.followup.checklist", locale=locale, name=name)],
+        )
+
+        due_text = due_at.strftime("%Y-%m-%d %H:%M")
+        await update.message.reply_text(
+            t("call.created", locale=locale, task_id=task.id, due=due_text)
+        )
+
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     date_arg = context.args[0] if context.args else None
     if date_arg:
@@ -958,6 +1024,8 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         tasks = crud.list_tasks_for_day(db, user.id, day)
         scheduled = [t for t in tasks if t.planned_start and not t.is_done]
         backlog = [t for t in tasks if t.planned_start is None and not t.is_done and t.task_type == "user"]
+        context.user_data["last_plan_day"] = day.isoformat()
+        context.user_data["last_plan_task_ids"] = [t.id for t in scheduled] + [t.id for t in backlog]
 
         await update.message.reply_text(render_day_plan(scheduled, backlog, day, routine, locale=locale))
 

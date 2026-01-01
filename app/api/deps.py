@@ -44,11 +44,11 @@ def _extract_bearer_token(authorization: str | None) -> str | None:
     return token or None
 
 
-def get_current_user(
+def _authenticate_user(
     request: Request,
-    db: Session = Depends(get_db),
-    authorization: str | None = Header(default=None, alias="Authorization"),
-    x_user_key: str | None = Header(default=None, alias="X-User-Key"),
+    db: Session,
+    authorization: str | None,
+    x_user_key: str | None,
 ) -> User:
     ip = _client_ip(request)
     tracker = get_auth_failure_tracker()
@@ -84,9 +84,14 @@ def get_current_user(
     if not user.is_active:
         raise HTTPException(status_code=403, detail="User is inactive")
 
+    request.state.user_id = user.id
+    return user
+
+
+def _apply_rate_limit(user: User, key_suffix: str, limit: int) -> None:
     limiter = get_rate_limiter()
-    key = f"token:{user.api_key_prefix or user.id}"
-    result = limiter.allow(key, settings.API_RATE_LIMIT_PER_MIN, settings.API_RATE_WINDOW_SEC)
+    key = f"token:{user.api_key_prefix or user.id}{key_suffix}"
+    result = limiter.allow(key, limit, settings.API_RATE_WINDOW_SEC)
     if not result.allowed:
         raise HTTPException(
             status_code=429,
@@ -94,8 +99,28 @@ def get_current_user(
             headers={"Retry-After": str(result.retry_after)},
         )
 
+
+def get_current_user(
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_user_key: str | None = Header(default=None, alias="X-User-Key"),
+) -> User:
+    user = _authenticate_user(request, db, authorization, x_user_key)
+    _apply_rate_limit(user, "", settings.API_RATE_LIMIT_PER_MIN)
     crud.touch_user_api_key(db, user.id)
-    request.state.user_id = user.id
+    return user
+
+
+def get_current_user_read(
+    request: Request,
+    db: Session = Depends(get_db),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_user_key: str | None = Header(default=None, alias="X-User-Key"),
+) -> User:
+    user = _authenticate_user(request, db, authorization, x_user_key)
+    _apply_rate_limit(user, ":read", settings.API_RATE_LIMIT_READ_PER_MIN)
+    crud.touch_user_api_key(db, user.id)
     return user
 
 
@@ -106,13 +131,5 @@ def get_current_user_ai(
     x_user_key: str | None = Header(default=None, alias="X-User-Key"),
 ) -> User:
     user = get_current_user(request, db, authorization, x_user_key)
-    limiter = get_rate_limiter()
-    key = f"token:{user.api_key_prefix or user.id}:ai"
-    result = limiter.allow(key, settings.API_RATE_LIMIT_AI_PER_MIN, settings.API_RATE_WINDOW_SEC)
-    if not result.allowed:
-        raise HTTPException(
-            status_code=429,
-            detail="Too many requests",
-            headers={"Retry-After": str(result.retry_after)},
-        )
+    _apply_rate_limit(user, ":ai", settings.API_RATE_LIMIT_AI_PER_MIN)
     return user
