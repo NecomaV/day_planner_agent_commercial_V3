@@ -352,6 +352,106 @@ def _remember_plan_context(context: ContextTypes.DEFAULT_TYPE, day: dt.date, tas
     context.user_data["last_plan_task_ids"] = [t.id for t in tasks] + [t.id for t in backlog]
 
 
+async def _handle_pending_start_prompt(
+    text: str,
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    db,
+    user,
+    routine,
+) -> bool:
+    if context.user_data.get("pending_action") or context.user_data.get("pending_task"):
+        return False
+    locale = locale_for_user(user)
+    pending_ids = context.user_data.get("pending_start_prompt_ids")
+    if pending_ids:
+        ids = _extract_task_ids(text)
+        if not ids:
+            await update.message.reply_text(t("start_prompt.invalid", locale=locale))
+            return True
+        if any(task_id not in pending_ids for task_id in ids):
+            await update.message.reply_text(t("start_prompt.out_of_range", locale=locale))
+            return True
+        context.user_data.pop("pending_start_prompt_ids", None)
+        task_id = ids[0]
+        task = crud.get_task(db, user.id, task_id)
+        if not task:
+            await update.message.reply_text(t("start_prompt.not_found", locale=locale, task_id=task_id))
+            return True
+        flags = parse_reply(text)
+        if flags.is_yes and not flags.is_no:
+            crud.mark_task_started(db, user.id, task_id, _now_local_naive())
+            await update.message.reply_text(
+                t("start_prompt.started", locale=locale, title=task.title, task_id=task.id)
+            )
+            return True
+        if flags.is_no or flags.is_cancel:
+            crud.clear_start_prompt(db, user.id, task_id)
+            await update.message.reply_text(
+                t("start_prompt.declined", locale=locale, task_id=task.id)
+            )
+            return True
+        await update.message.reply_text(t("common.reply_yes_no", locale=locale))
+        return True
+
+    pending = crud.list_pending_start_prompts(db, user.id)
+    if not pending:
+        return False
+
+    flags = parse_reply(text)
+    ids = _extract_task_ids(text)
+    if len(pending) == 1:
+        task = pending[0]
+        if flags.is_yes and not flags.is_no:
+            crud.mark_task_started(db, user.id, task.id, _now_local_naive())
+            await update.message.reply_text(
+                t("start_prompt.started", locale=locale, title=task.title, task_id=task.id)
+            )
+            return True
+        if flags.is_no or flags.is_cancel:
+            crud.clear_start_prompt(db, user.id, task.id)
+            await update.message.reply_text(
+                t("start_prompt.declined", locale=locale, task_id=task.id)
+            )
+            return True
+        if ids:
+            if ids[0] != task.id:
+                await update.message.reply_text(t("start_prompt.out_of_range", locale=locale))
+                return True
+            await update.message.reply_text(t("common.reply_yes_no", locale=locale))
+            return True
+        return False
+
+    if ids:
+        task_id = ids[0]
+        task = crud.get_task(db, user.id, task_id)
+        if not task or task_id not in [t.id for t in pending]:
+            await update.message.reply_text(t("start_prompt.out_of_range", locale=locale))
+            return True
+        if flags.is_yes and not flags.is_no:
+            crud.mark_task_started(db, user.id, task_id, _now_local_naive())
+            await update.message.reply_text(
+                t("start_prompt.started", locale=locale, title=task.title, task_id=task.id)
+            )
+            return True
+        if flags.is_no or flags.is_cancel:
+            crud.clear_start_prompt(db, user.id, task_id)
+            await update.message.reply_text(
+                t("start_prompt.declined", locale=locale, task_id=task.id)
+            )
+            return True
+        await update.message.reply_text(t("common.reply_yes_no", locale=locale))
+        return True
+
+    if flags.is_yes or flags.is_no or flags.is_cancel:
+        context.user_data["pending_start_prompt_ids"] = [t.id for t in pending]
+        lines = [t("start_prompt.choose", locale=locale)]
+        lines.extend([_format_task_choice(t, routine, locale) for t in pending])
+        await update.message.reply_text("\n".join(lines))
+        return True
+
+    return False
+
 def _sanitize_ai_reply(reply: str | None, locale: str) -> str | None:
     if not reply:
         return reply
@@ -798,6 +898,9 @@ async def _process_user_text(
         return
 
     if await _handle_pending_task(text, update, context, db, user, routine):
+        return
+
+    if await _handle_pending_start_prompt(text, update, context, db, user, routine):
         return
 
     if await _handle_pending_action(text, update, context, db, user, routine):

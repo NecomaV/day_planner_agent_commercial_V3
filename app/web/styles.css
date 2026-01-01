@@ -386,6 +386,21 @@ button:disabled {
   opacity: 0.25;
 }
 
+.task.drag-source,
+.backlog-item.drag-source {
+  position: absolute;
+  top: -9999px;
+  left: -9999px;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: 0 !important;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
 .task-placeholder {
   height: 48px;
   border-radius: 10px;

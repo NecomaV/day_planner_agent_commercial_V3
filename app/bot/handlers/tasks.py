@@ -14,6 +14,7 @@ from app.bot.parsing.ru_reply import parse_reply
 from app.bot.parsing.text import extract_task_ids, is_no_due
 from app.bot.parsing.time import (
     _extract_task_timing,
+    _has_due_intent,
     _parse_time_range,
     _parse_time_value,
     _resolve_date_for_time,
@@ -304,6 +305,9 @@ async def _handle_pending_action(
         return True
     ids = extract_task_ids(text)
     if not ids:
+        if not re.search(r"\d", text):
+            context.user_data.pop("pending_action", None)
+            return False
         await update.message.reply_text(t("tasks.selection.invalid", locale=locale))
         return True
     candidate_ids = set(pending.get("candidate_ids") or [])

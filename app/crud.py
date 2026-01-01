@@ -523,6 +523,74 @@ def list_tasks_for_reminders(db: Session, user_id: int, now: dt.datetime, lead_m
     )
 
 
+def list_tasks_for_start_prompt(
+    db: Session,
+    user_id: int,
+    now: dt.datetime,
+    window_minutes: int,
+) -> list[Task]:
+    start_window = now - dt.timedelta(minutes=window_minutes)
+    return list(
+        db.execute(
+            select(Task)
+            .where(
+                and_(
+                    Task.user_id == user_id,
+                    Task.task_type == "user",
+                    Task.is_done.is_(False),
+                    Task.planned_start.is_not(None),
+                    Task.planned_start >= start_window,
+                    Task.planned_start <= now,
+                    Task.start_prompt_sent_at.is_(None),
+                )
+            )
+            .order_by(Task.planned_start.asc(), Task.id.asc())
+        ).scalars()
+    )
+
+
+def list_pending_start_prompts(db: Session, user_id: int) -> list[Task]:
+    return list(
+        db.execute(
+            select(Task)
+            .where(
+                and_(
+                    Task.user_id == user_id,
+                    Task.is_done.is_(False),
+                    Task.start_prompt_pending.is_(True),
+                )
+            )
+            .order_by(Task.start_prompt_sent_at.desc().nullslast(), Task.id.asc())
+        ).scalars()
+    )
+
+
+def mark_start_prompt_sent(db: Session, user_id: int, task_id: int, at: dt.datetime) -> None:
+    task = get_task(db, user_id, task_id)
+    if not task:
+        return
+    task.start_prompt_sent_at = at
+    task.start_prompt_pending = True
+    db.add(task)
+
+
+def clear_start_prompt(db: Session, user_id: int, task_id: int) -> None:
+    task = get_task(db, user_id, task_id)
+    if not task:
+        return
+    task.start_prompt_pending = False
+    db.add(task)
+
+
+def mark_task_started(db: Session, user_id: int, task_id: int, at: dt.datetime) -> None:
+    task = get_task(db, user_id, task_id)
+    if not task:
+        return
+    task.started_at = at
+    task.start_prompt_pending = False
+    db.add(task)
+
+
 def list_tasks_with_location(db: Session, user_id: int) -> list[Task]:
     return list(
         db.execute(

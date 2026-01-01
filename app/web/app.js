@@ -48,6 +48,7 @@ const dragState = {
   draggingId: null,
   placeholder: null,
   element: null,
+  sourceClassApplied: false,
 };
 
 function setStatus(message, isError = false) {
@@ -345,6 +346,12 @@ function handleDragStart(event, taskId, element) {
   } catch (err) {
     // ignore
   }
+  if (dragState.placeholder) {
+    dragState.placeholder.remove();
+  }
+  if (dragState.element) {
+    dragState.element.classList.remove('drag-source');
+  }
   dragState.draggingId = String(taskId);
   dragState.element = element;
   if (element) {
@@ -354,7 +361,8 @@ function handleDragStart(event, taskId, element) {
     placeholder.style.height = `${element.getBoundingClientRect().height}px`;
     element.after(placeholder);
     requestAnimationFrame(() => {
-      element.style.visibility = 'hidden';
+      element.classList.add('drag-source');
+      dragState.sourceClassApplied = true;
     });
     dragState.placeholder = placeholder;
   }
@@ -363,7 +371,7 @@ function handleDragStart(event, taskId, element) {
 function handleDragEnd() {
   if (dragState.element) {
     dragState.element.classList.remove('dragging');
-    dragState.element.style.visibility = '';
+    dragState.element.classList.remove('drag-source');
   }
   if (dragState.placeholder) {
     dragState.placeholder.remove();
@@ -371,10 +379,24 @@ function handleDragEnd() {
   dragState.draggingId = null;
   dragState.placeholder = null;
   dragState.element = null;
+  dragState.sourceClassApplied = false;
 }
 
 function getDraggedTaskId(event) {
-  return event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
+  if (event.dataTransfer) {
+    const value = event.dataTransfer.getData('text/task-id') || event.dataTransfer.getData('text/plain');
+    if (value) return value;
+  }
+  return dragState.draggingId;
+}
+
+function movePlaceholder(target, before) {
+  if (!dragState.placeholder || !target || target === dragState.placeholder) return;
+  const parent = target.parentElement;
+  if (!parent) return;
+  const next = before ? target : target.nextSibling;
+  if (next === dragState.placeholder) return;
+  parent.insertBefore(dragState.placeholder, next);
 }
 
 async function handleDropOnDay(event, dateStr) {
@@ -523,6 +545,11 @@ function renderTask(task, dayDateStr = null) {
   item.addEventListener('dragover', (event) => {
     event.preventDefault();
     item.classList.add('drag-over');
+    if (dragState.placeholder && dragState.element && dragState.element !== item) {
+      const rect = item.getBoundingClientRect();
+      const before = event.clientY < rect.top + rect.height / 2;
+      movePlaceholder(item, before);
+    }
   });
   item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
   item.addEventListener('drop', async (event) => {
@@ -740,6 +767,9 @@ function renderDayList(dayKey, tasks) {
   dayList.ondragover = (event) => {
     event.preventDefault();
     dayList.classList.add('drag-over');
+    if (dragState.placeholder && event.target === dayList) {
+      dayList.appendChild(dragState.placeholder);
+    }
   };
   dayList.ondragleave = () => dayList.classList.remove('drag-over');
   dayList.ondrop = async (event) => {

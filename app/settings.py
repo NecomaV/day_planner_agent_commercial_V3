@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     CALL_FOLLOWUP_DAYS: int = 1
     DELAY_GRACE_MIN: int = 10
     LOCATION_STALE_MIN: int = 60
+    START_PROMPT_WINDOW_MIN: int = 10
 
     # AI (optional)
     OPENAI_API_KEY: str | None = None

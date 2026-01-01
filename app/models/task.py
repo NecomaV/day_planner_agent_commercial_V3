@@ -48,6 +48,9 @@ class Task(Base):
     schedule_source: Mapped[str] = mapped_column(String(20), default="manual", index=True)
     reminder_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     late_prompt_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    start_prompt_sent_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    start_prompt_pending: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    started_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     # Location-based reminders
     location_label: Mapped[str | None] = mapped_column(String(120), nullable=True)

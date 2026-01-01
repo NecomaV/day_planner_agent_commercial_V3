@@ -6,6 +6,7 @@ from app import crud
 from app.bot.context import get_db_session
 from app.bot.utils import distance_m, now_local_naive
 from app.i18n.core import locale_for_user, t
+from app.bot.rendering.keyboard import yes_no_keyboard
 from app.services.reminders import format_reminder_message
 from app.settings import settings
 
@@ -35,6 +36,39 @@ async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             for task in tasks:
                 task.reminder_sent_at = now
+
+        # Start prompt at task time
+        for user_id, user in users.items():
+            if not getattr(user, "is_active", True):
+                continue
+            locale = locale_for_user(user)
+            start_tasks = crud.list_tasks_for_start_prompt(
+                db,
+                user_id,
+                now,
+                settings.START_PROMPT_WINDOW_MIN,
+            )
+            if not start_tasks:
+                continue
+            try:
+                chat_id = int(user.telegram_chat_id)
+            except ValueError:
+                chat_id = user.telegram_chat_id
+            for task in start_tasks:
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=t(
+                            "start_prompt.ask",
+                            locale=locale,
+                            title=task.title,
+                            task_id=task.id,
+                        ),
+                        reply_markup=yes_no_keyboard(locale),
+                    )
+                    crud.mark_start_prompt_sent(db, user_id, task.id, now)
+                except Exception:
+                    continue
 
         # Late prompt
         for user_id, user in users.items():
